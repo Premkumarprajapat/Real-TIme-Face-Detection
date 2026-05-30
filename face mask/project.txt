@@ -1,0 +1,3783 @@
+
+
+"""
+Streamlit UI — Advanced Face Recognition System.
+Two modes: User (recognition) and Admin (management).
+"""
+
+import streamlit as st
+import cv2
+import numpy as np
+import face_recognition as fr
+import time
+import os
+import glob
+import re
+from datetime import datetime
+
+import config
+from face_encoder import encode_known_faces, load_encodings
+from liveness import LivenessDetector
+from depth_motion_check import DepthMotionChecker
+from database import AttendanceDB
+from unknown_handler import UnknownFaceHandler
+from security import SecurityManager
+from tamper_proof_log import TamperProofLog
+from adaptive_learning import AdaptiveLearner
+from preprocessing import enhance_frame, get_brightness_status
+
+# ─── Page Config ─────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="Face Recognition System",
+    page_icon="🔐",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# ─── Custom CSS ──────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+    .stApp { font-family: 'Inter', sans-serif; }
+
+    .main-header {
+        background: linear-gradient(135deg, #0f0c29 0%, #302b63 50%, #24243e 100%);
+        padding: 1.5rem 2rem; border-radius: 16px; margin-bottom: 1.5rem;
+        text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+    }
+    .main-header h1 { color: #fff; font-size: 2rem; font-weight: 700; margin: 0; }
+    .main-header p { color: #a5b4fc; font-size: 0.95rem; margin: 0.3rem 0 0 0; }
+
+    .status-card {
+        background: linear-gradient(135deg, #1e1e2e, #2d2d44);
+        border: 1px solid #3d3d5c; border-radius: 12px;
+        padding: 1.2rem; margin: 0.5rem 0; color: #e2e8f0;
+    }
+    .status-card h3 {
+        color: #a5b4fc; margin: 0 0 0.5rem 0; font-size: 0.85rem;
+        text-transform: uppercase; letter-spacing: 1px;
+    }
+    .status-card .value { font-size: 1.5rem; font-weight: 700; color: #fff; }
+
+    .access-granted {
+        background: linear-gradient(135deg, #065f46, #047857);
+        border: 2px solid #10b981; border-radius: 16px; padding: 2rem;
+        text-align: center; color: white;
+        animation: pulse 1.5s ease-in-out infinite;
+    }
+    @keyframes pulse {
+        0%, 100% { box-shadow: 0 0 20px rgba(16,185,129,0.3); }
+        50% { box-shadow: 0 0 40px rgba(16,185,129,0.6); }
+    }
+
+    .access-denied {
+        background: linear-gradient(135deg, #7f1d1d, #991b1b);
+        border: 2px solid #ef4444; border-radius: 16px; padding: 2rem;
+        text-align: center; color: white;
+    }
+
+    .info-badge {
+        display: inline-block; background: #3b82f6; color: white;
+        padding: 0.2rem 0.6rem; border-radius: 20px;
+        font-size: 0.75rem; font-weight: 600;
+    }
+
+    .attendance-table { width: 100%; border-collapse: collapse; }
+    .attendance-table th {
+        background: #302b63; color: #fff; padding: 10px 15px;
+        text-align: left; font-size: 0.85rem;
+    }
+    .attendance-table td {
+        padding: 8px 15px; border-bottom: 1px solid #2d2d44;
+        color: #e2e8f0; font-size: 0.9rem;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# ─── Header ──────────────────────────────────────────────────────────────────
+st.markdown("""
+<div class="main-header">
+    <h1>🔐 Advanced Face Recognition System</h1>
+    <p>Offline · Secure · Adaptive · Tamper-Proof</p>
+</div>
+""", unsafe_allow_html=True)
+
+# ─── Session State ───────────────────────────────────────────────────────────
+if "admin_authenticated" not in st.session_state:
+    st.session_state.admin_authenticated = False
+if "camera_running" not in st.session_state:
+    st.session_state.camera_running = False
+if "admin_face_feedback" not in st.session_state:
+    st.session_state.admin_face_feedback = None
+
+# ─── Cached Resources ───────────────────────────────────────────────────────
+@st.cache_resource
+def get_data():
+    return load_encodings()
+
+@st.cache_resource
+def get_db():
+    return AttendanceDB()
+
+@st.cache_resource
+def get_security():
+    return SecurityManager()
+
+@st.cache_resource
+def get_log():
+    return TamperProofLog()
+
+@st.cache_resource
+def get_adaptive():
+    return AdaptiveLearner()
+
+
+def sanitize_person_name(name: str) -> str:
+    """Normalize a person name so it can be used safely as a folder name."""
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", name or "")
+    return " ".join(cleaned.strip().split())
+
+
+def get_pending_face_batches() -> list:
+    """Return people waiting in known_faces with their pending image counts."""
+    pending = []
+    if not os.path.exists(config.KNOWN_FACES_DIR):
+        return pending
+
+    for person_name in sorted(os.listdir(config.KNOWN_FACES_DIR)):
+        person_dir = os.path.join(config.KNOWN_FACES_DIR, person_name)
+        if not os.path.isdir(person_dir):
+            continue
+
+        image_count = len(
+            glob.glob(os.path.join(person_dir, "*.jpg")) +
+            glob.glob(os.path.join(person_dir, "*.jpeg")) +
+            glob.glob(os.path.join(person_dir, "*.png")) +
+            glob.glob(os.path.join(person_dir, "*.bmp")) +
+            glob.glob(os.path.join(person_dir, "*.webp"))
+        )
+
+        if image_count:
+            pending.append({
+                "name": person_name,
+                "count": image_count,
+                "path": person_dir,
+            })
+
+    return pending
+
+
+def save_uploaded_faces(person_name: str, uploaded_files) -> tuple:
+    """Save uploaded face images to known_faces/<PersonName>/."""
+    safe_name = sanitize_person_name(person_name)
+    if not safe_name:
+        raise ValueError("Enter a valid person name.")
+
+    if not uploaded_files:
+        raise ValueError("Upload at least one image.")
+
+    person_dir = os.path.join(config.KNOWN_FACES_DIR, safe_name)
+    os.makedirs(person_dir, exist_ok=True)
+
+    saved_count = 0
+    for index, uploaded_file in enumerate(uploaded_files, start=1):
+        extension = os.path.splitext(uploaded_file.name)[1].lower() or ".jpg"
+        if extension not in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}:
+            extension = ".jpg"
+
+        filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{index}{extension}"
+        file_path = os.path.join(person_dir, filename)
+        with open(file_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+        saved_count += 1
+
+    return safe_name, saved_count
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+tab_user, tab_admin = st.tabs(["👤 Recognition", "🛡️ Admin Panel"])
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TAB 1: USER — Recognition
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab_user:
+    st.markdown("### 🎥 Face Recognition & Attendance")
+    st.markdown("Click **Start Camera** to begin a recognition session with anti-spoofing verification.")
+
+    col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
+    with col1:
+        start_btn = st.button("▶️ Start Camera", type="primary")
+    with col2:
+        stop_btn = st.button("⏹️ Stop Camera")
+    with col3:
+        threshold = st.slider("Threshold", 0.35, 0.60, 0.50, 0.01)
+    with col4:
+        depth_enabled = st.checkbox("Depth Check", value=config.DEPTH_CHECK_ENABLED)
+
+    # Camera display in centered smaller column
+    _, cam_col, _ = st.columns([1, 2, 1])
+    with cam_col:
+        status_area = st.empty()
+        depth_status_area = st.empty()
+        frame_display = st.empty()
+    result_area = st.empty()
+
+    if stop_btn:
+        st.session_state.camera_running = False
+
+    if start_btn:
+        st.session_state.camera_running = True
+
+        data = get_data()
+        security = get_security()
+        log = get_log()
+        db = get_db()
+
+        if security.is_locked():
+            result_area.markdown("""
+            <div class="access-denied">
+                <h2>🔒 SYSTEM LOCKED</h2>
+                <p>Too many failed attempts. Go to Admin Panel to unlock.</p>
+            </div>
+            """, unsafe_allow_html=True)
+            st.session_state.camera_running = False
+        elif not data["encodings"]:
+            st.warning("⚠️ No face encodings found. Run `python admin.py --encode` first.")
+            st.session_state.camera_running = False
+        else:
+            cap = cv2.VideoCapture(config.CAMERA_INDEX)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.FRAME_WIDTH)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.FRAME_HEIGHT)
+
+            if not cap.isOpened():
+                st.error("❌ Cannot open camera!")
+                st.session_state.camera_running = False
+            else:
+                liveness = LivenessDetector()
+                depth_checker = DepthMotionChecker() if depth_enabled else None
+                unknown_handler = UnknownFaceHandler()
+
+                attempt_start = time.time()
+                blink_count = 0
+                name_counter = {}
+                last_name = "UNKNOWN"
+                last_confidence = 0.0
+                last_unknown_capture = time.time()
+                attempt_recorded = False
+                frame_count = 0
+                final_result = None
+
+                # Phases: "recognition", "depth", "done"
+                phase = "recognition"
+                confirmed_name = None
+                confirmed_conf = 0.0
+
+                # Persistent face box state (drawn every frame)
+                draw_box = None
+                draw_name = "UNKNOWN"
+                draw_conf = 0.0
+
+                while st.session_state.camera_running:
+                    ret, frame = cap.read()
+                    if not ret:
+                        st.error("Camera error!")
+                        break
+
+                    frame_count += 1
+                    now = time.time()
+                    elapsed = now - attempt_start
+                    remaining = max(0, int(config.UNKNOWN_TIMEOUT - elapsed))
+
+                    # ── 30s TIMEOUT (only in recognition phase) ──
+                    if elapsed > config.UNKNOWN_TIMEOUT and phase == "recognition":
+                        if last_name == "UNKNOWN":
+                            unknown_handler._capture_image(frame, None)
+                            log.append_log("TIMEOUT", "Unknown", 0, "30s expired")
+                            final_result = ("denied", "UNKNOWN", 0)
+                        else:
+                            log.append_log("TIMEOUT", last_name, last_confidence / 100.0,
+                                           "Blink not completed")
+                            final_result = ("timeout", last_name, last_confidence)
+                        break
+
+                    # ── PREPROCESSING ──
+                    enhanced = enhance_frame(frame.copy())
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+                    # ═══════════════════════════════════════════════
+                    #  PHASE: DEPTH / MOTION CHECK
+                    # ═══════════════════════════════════════════════
+                    if phase == "depth" and depth_checker:
+                        depth_checker.process_frame(frame)
+                        task_info = depth_checker.get_current_task_info()
+
+                        # Draw depth UI
+                        display_frame = enhanced.copy()
+                        state = task_info.get("state", "")
+                        instruction = task_info.get("instruction", "")
+                        icon = task_info.get("icon", "")
+                        task_idx = task_info.get("task_index", 0)
+                        total = task_info.get("total_tasks", 0)
+                        time_rem = task_info.get("time_remaining", 0)
+                        progress = task_info.get("progress", [])
+
+                        # Draw task instruction on frame
+                        h_f, w_f = display_frame.shape[:2]
+                        overlay = display_frame.copy()
+                        cv2.rectangle(overlay, (0, 0), (w_f, 60), (80, 40, 0), -1)
+                        cv2.addWeighted(overlay, 0.7, display_frame, 0.3, 0, display_frame)
+                        cv2.putText(display_frame,
+                                    f"DEPTH CHECK: {confirmed_name} ({confirmed_conf:.1f}%)",
+                                    (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+                        task_text = f"Task {task_idx + 1}/{total}"
+                        cv2.putText(display_frame, task_text,
+                                    (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+
+                        if state == "BASELINE":
+                            text = "Hold STILL — capturing baseline..."
+                            tsz = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+                            tx = (w_f - tsz[0]) // 2
+                            ty = h_f // 2
+                            cv2.rectangle(display_frame, (tx - 10, ty - 30),
+                                          (tx + tsz[0] + 10, ty + 10), (0, 0, 0), -1)
+                            cv2.putText(display_frame, text, (tx, ty),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+                        elif state == "TASK_ACTIVE":
+                            text = f"{icon}  {instruction}"
+                            tsz = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+                            tx = (w_f - tsz[0]) // 2
+                            ty = h_f // 2
+                            cv2.rectangle(display_frame, (tx - 15, ty - 35),
+                                          (tx + tsz[0] + 15, ty + 15), (0, 80, 0), -1)
+                            cv2.putText(display_frame, text, (tx, ty),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+                        # Status bars
+                        depth_info = f"🔍 Depth Check: Task {task_idx + 1}/{total}"
+                        if state == "BASELINE":
+                            depth_info += " | 📷 Hold still..."
+                        elif state == "TASK_ACTIVE":
+                            depth_info += f" | {icon} {instruction} ({time_rem:.1f}s)"
+                        elif state == "ALL_DONE":
+                            depth_info += " | ✅ Complete"
+
+                        # Show task results so far
+                        for i, res in enumerate(progress):
+                            r_icon = "✅" if res["passed"] else "❌"
+                            depth_info += f" | T{i+1}:{r_icon}"
+
+                        depth_status_area.warning(depth_info)
+
+                        frame_display.image(cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB),
+                                            channels="RGB")
+
+                        # Check if depth check is complete
+                        if depth_checker.is_complete():
+                            if depth_checker.is_passed():
+                                db.log_attendance(confirmed_name, confirmed_conf / 100.0)
+                                log.append_log("ACCESS_GRANTED", confirmed_name,
+                                               confirmed_conf / 100.0,
+                                               f"Blinks: {blink_count} | Depth: PASS")
+                                security.record_attempt(True)
+                                final_result = ("granted", confirmed_name, confirmed_conf)
+                            else:
+                                log.append_log("DEPTH_FAIL", confirmed_name,
+                                               confirmed_conf / 100.0,
+                                               "Depth/motion check failed")
+                                security.record_attempt(False)
+                                final_result = ("spoofing", confirmed_name, confirmed_conf)
+
+                                # Save spoofing image to digital_theft folder
+                                try:
+                                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                    theft_path = os.path.join(
+                                        config.DIGITAL_THEFT_DIR,
+                                        f"spoof_{confirmed_name}_{ts}.jpg"
+                                    )
+                                    cv2.imwrite(theft_path, frame)
+                                except Exception:
+                                    pass
+                            break
+
+                        continue
+
+                    # ═══════════════════════════════════════════════
+                    #  PHASE: RECOGNITION + BLINK
+                    # ═══════════════════════════════════════════════
+
+                    # ── BLINK DETECTION (every frame) ──
+                    try:
+                        blink_result = liveness.detect_blink(frame)
+                        blink_count = blink_result["blink_count"]
+                    except Exception:
+                        pass
+
+                    # ── FACE RECOGNITION (every 3rd frame) ──
+                    if frame_count % 3 == 0:
+                        try:
+                            boxes = fr.face_locations(rgb, model=config.FACE_RECOGNITION_MODEL)
+                            encodings = fr.face_encodings(rgb, boxes)
+                        except Exception:
+                            boxes, encodings = [], []
+
+                        if not boxes:
+                            draw_box = None
+
+                        for (top, right, bottom, left), encoding in zip(boxes, encodings):
+                            name = "UNKNOWN"
+                            confidence = 0.0
+
+                            if len(data["encodings"]) > 0:
+                                distances = fr.face_distance(data["encodings"], encoding)
+                                min_dist = float(np.min(distances))
+                                index = int(np.argmin(distances))
+                                confidence = round((1 - min_dist) * 100, 2)
+
+                                if min_dist < threshold and confidence > 50:
+                                    name = data["names"][index]
+
+                            if confidence < 45:
+                                name = "UNKNOWN"
+
+                            # Multi-frame confirmation
+                            if name != "UNKNOWN":
+                                name_counter[name] = name_counter.get(name, 0) + 1
+                            else:
+                                name_counter.clear()
+
+                            last_name = name
+                            last_confidence = confidence
+
+                            draw_box = (top, right, bottom, left)
+                            draw_name = name
+                            draw_conf = confidence
+
+                            # FACE CONFIRMED + BLINKS DONE → start depth check or grant
+                            if (name != "UNKNOWN"
+                                    and name_counter.get(name, 0) >= 5
+                                    and blink_count >= config.REQUIRED_BLINKS):
+
+                                confirmed_name = name
+                                confirmed_conf = confidence
+
+                                if depth_enabled and depth_checker:
+                                    phase = "depth"
+                                    depth_checker.start_session()
+                                    liveness.reset()
+                                    status_area.info(
+                                        f"🟢 {name} confirmed! Starting depth/motion check...")
+                                else:
+                                    db.log_attendance(name, confidence / 100.0)
+                                    log.append_log("ACCESS_GRANTED", name, confidence / 100.0,
+                                                   f"Blinks: {blink_count}")
+                                    security.record_attempt(True)
+                                    final_result = ("granted", name, confidence)
+                                break
+
+                            # Unknown tracking
+                            if name == "UNKNOWN" and confidence < 45:
+                                if now - last_unknown_capture >= config.UNKNOWN_CAPTURE_INTERVAL:
+                                    unknown_handler.process_unknown(
+                                        frame, (top, right, bottom, left))
+                                    last_unknown_capture = now
+
+                                if not attempt_recorded:
+                                    attempt_recorded = True
+                                    security.record_attempt(False)
+                                    log.append_log("ACCESS_DENIED", "Unknown",
+                                                   confidence / 100.0, "Unknown face")
+
+                        if final_result:
+                            break
+
+                    # ── DRAW FACE BOX ON EVERY FRAME ──
+                    display_frame = enhanced.copy()
+                    if draw_box is not None:
+                        top, right, bottom, left = draw_box
+                        color = (0, 255, 0) if draw_name != "UNKNOWN" else (0, 0, 255)
+                        cv2.rectangle(display_frame, (left, top), (right, bottom), color, 2)
+                        label = f"{draw_name} ({draw_conf:.1f}%)"
+                        lsz = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+                        cv2.rectangle(display_frame, (left, top - lsz[1] - 10),
+                                      (left + lsz[0] + 6, top), color, -1)
+                        cv2.putText(display_frame, label, (left + 3, top - 4),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+                    # HUD
+                    cv2.putText(display_frame, f"Blinks: {blink_count}/{config.REQUIRED_BLINKS}",
+                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                    cv2.putText(display_frame, f"Time: {remaining}s",
+                                (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                    if depth_enabled:
+                        cv2.putText(display_frame, "Depth Check: ON",
+                                    (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 165, 0), 1)
+
+                    # ── STATUS BAR ──
+                    blink_text = f"👁️ Blinks: {blink_count}/{config.REQUIRED_BLINKS}"
+                    confirmed = max(name_counter.values()) if name_counter else 0
+                    confirm_text = f"✅ Confirmed: {min(confirmed, 5)}/5"
+                    depth_text = " | 🔍 Depth: ON" if depth_enabled else ""
+                    status_text = f"⏱️ {remaining}s | {blink_text} | {confirm_text}{depth_text}"
+                    if last_name != "UNKNOWN":
+                        status_text += f" | 🟢 {last_name} ({last_confidence:.1f}%)"
+                    status_area.info(status_text)
+
+                    # ── DISPLAY FRAME ──
+                    frame_display.image(cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB),
+                                        channels="RGB")
+
+                # ── CLEANUP ──
+                cap.release()
+                liveness.release()
+                if depth_checker:
+                    depth_checker.release()
+                st.session_state.camera_running = False
+
+                # ── SHOW RESULT ──
+                if final_result:
+                    status, name, conf = final_result
+                    if status == "granted":
+                        result_area.markdown(f"""
+                        <div class="access-granted">
+                            <h2>✅ ACCESS GRANTED</h2>
+                            <p style="font-size:1.3rem; margin:0.5rem 0;">Welcome, <strong>{name}</strong></p>
+                            <p>Confidence: {conf:.1f}% | Attendance logged</p>
+                            <p style="font-size:0.85rem; color: #a7f3d0;">{'🔍 Depth/motion verified' if depth_enabled else '👁️ Blink verified'}</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        status_area.success(f"✅ Access granted to {name}! Attendance logged.")
+                        depth_status_area.empty()
+                    elif status == "spoofing":
+                        result_area.markdown(f"""
+                        <div class="access-denied">
+                            <h2>🚨 SPOOFING DETECTED</h2>
+                            <p>Face matched <strong>{name}</strong> ({conf:.1f}%), but <strong>depth/motion check failed</strong>.</p>
+                            <p>Screen replay or photo detected. Access denied.</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        status_area.error("🚨 Spoofing detected — depth/motion check failed!")
+                        depth_status_area.empty()
+                    elif status == "timeout":
+                        result_area.markdown(f"""
+                        <div class="access-denied">
+                            <h2>⏱️ TIME OUT</h2>
+                            <p>Detected <strong>{name}</strong> ({conf:.1f}%) but verification was not completed.</p>
+                            <p>Please try again.</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    elif status == "denied":
+                        result_area.markdown(f"""
+                        <div class="access-denied">
+                            <h2>❌ ACCESS DENIED</h2>
+                            <p>Unknown face detected. Image saved for review.</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TAB 2: ADMIN PANEL
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab_admin:
+    st.markdown("### 🛡️ Admin Panel")
+
+    if not st.session_state.admin_authenticated:
+        st.markdown("Enter admin password to access the control panel.")
+
+        with st.form("admin_login"):
+            password = st.text_input("Admin Password", type="password")
+            login_btn = st.form_submit_button("🔓 Login", type="primary")
+
+        if login_btn:
+            security = get_security()
+            if security.verify_admin_password(password):
+                st.session_state.admin_authenticated = True
+                st.rerun()
+            else:
+                st.error("❌ Invalid password!")
+    else:
+        col_top1, col_top2 = st.columns([4, 1])
+        with col_top2:
+            if st.button("🚪 Logout"):
+                st.session_state.admin_authenticated = False
+                st.rerun()
+
+        security = get_security()
+        db = get_db()
+        log = get_log()
+        adaptive = get_adaptive()
+
+        admin_tab1, admin_tab2, admin_tab3, admin_tab4, admin_tab5, admin_tab6 = st.tabs(["📊 Status", "📋 Attendance", "🔑 Password", "👤 Unknown Faces", "🚨 Digital Theft", "🔓 Unlock"])
+
+        # ─── 1. STATUS ────────────────────────────────────────────────
+        with admin_tab1:
+            st.markdown("#### System Status Overview")
+
+            if st.button("🔄 Refresh Status", key="refresh_status"):
+                st.cache_resource.clear()
+
+            sec_status = security.get_status()
+            data = get_data()
+            integrity = log.verify_integrity()
+            adaptive_stats = adaptive.get_stats()
+            today_count = db.get_count()
+            registered = list(set(data["names"])) if data["names"] else []
+
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                lock_icon = "🔒 LOCKED" if sec_status["locked"] else "🔓 Unlocked"
+                lock_color = "🔴" if sec_status["locked"] else "🟢"
+                st.markdown(f"""
+                <div class="status-card">
+                    <h3>Security</h3>
+                    <div class="value">{lock_color} {lock_icon}</div>
+                    <p>Failed: {sec_status['failed_attempts']}/{sec_status['max_attempts']}</p>
+                </div>
+                """, unsafe_allow_html=True)
+            with col2:
+                st.markdown(f"""
+                <div class="status-card">
+                    <h3>Registered People</h3>
+                    <div class="value">{len(registered)}</div>
+                    <p>{len(data['encodings'])} embeddings</p>
+                </div>
+                """, unsafe_allow_html=True)
+            with col3:
+                st.markdown(f"""
+                <div class="status-card">
+                    <h3>Today's Attendance</h3>
+                    <div class="value">{today_count}</div>
+                    <p>{datetime.now().strftime('%Y-%m-%d')}</p>
+                </div>
+                """, unsafe_allow_html=True)
+            with col4:
+                log_icon = "✅" if integrity["valid"] else "❌ TAMPERED"
+                st.markdown(f"""
+                <div class="status-card">
+                    <h3>Log Integrity</h3>
+                    <div class="value">{log_icon}</div>
+                    <p>{integrity['total_entries']} entries</p>
+                </div>
+                """, unsafe_allow_html=True)
+
+            if registered:
+                st.markdown("**Registered Names:**")
+                name_tags = " ".join([f'<span class="info-badge">{n}</span>' for n in sorted(registered)])
+                st.markdown(name_tags, unsafe_allow_html=True)
+
+            st.markdown(f"**Adaptive Learning:** {adaptive_stats['pending']} pending, "
+                        f"{adaptive_stats['reviewed']} reviewed")
+
+            st.markdown("---")
+            st.markdown("#### Add New Faces And Train Model")
+            st.caption(
+                "Upload new user images into `known_faces`, then train only those pending folders. "
+                "Existing names and embeddings stay untouched, and only the processed source images "
+                "for newly added users are deleted after embedding."
+            )
+
+            feedback = st.session_state.pop("admin_face_feedback", None)
+            if feedback:
+                if feedback["level"] == "success":
+                    st.success(feedback["message"])
+                elif feedback["level"] == "warning":
+                    st.warning(feedback["message"])
+                else:
+                    st.error(feedback["message"])
+
+            pending_batches = get_pending_face_batches()
+
+            add_col, queue_col = st.columns([3, 2])
+            with add_col:
+                with st.form("add_new_faces_form", clear_on_submit=True):
+                    person_name = st.text_input("Person Name")
+                    uploaded_files = st.file_uploader(
+                        "Upload face images",
+                        type=["jpg", "jpeg", "png", "bmp", "webp"],
+                        accept_multiple_files=True
+                    )
+                    save_faces_btn = st.form_submit_button("Add To Known Faces", type="primary")
+
+                if save_faces_btn:
+                    try:
+                        saved_name, saved_count = save_uploaded_faces(person_name, uploaded_files)
+                        st.session_state.admin_face_feedback = {
+                            "level": "success",
+                            "message": (
+                                f"Saved {saved_count} image(s) for {saved_name} in known_faces. "
+                                "Click Train Model to create embeddings."
+                            ),
+                        }
+                    except ValueError as exc:
+                        st.session_state.admin_face_feedback = {
+                            "level": "error",
+                            "message": str(exc),
+                        }
+                    st.rerun()
+
+            with queue_col:
+                st.markdown("**Pending Training Queue**")
+                if pending_batches:
+                    for batch in pending_batches:
+                        st.markdown(
+                            f"- **{batch['name']}**: {batch['count']} image(s) in `{batch['path']}`"
+                        )
+                else:
+                    st.info("No pending face images in known_faces.")
+
+            if st.button("Train Model", type="primary", key="train_model_btn"):
+                if not pending_batches:
+                    st.session_state.admin_face_feedback = {
+                        "level": "warning",
+                        "message": "There are no pending images to train.",
+                    }
+                    st.rerun()
+
+                before_embeddings = len(data["encodings"])
+                updated_data = encode_known_faces(delete_originals=True, preserve_existing=True)
+                added_embeddings = max(0, len(updated_data["encodings"]) - before_embeddings)
+
+                st.cache_resource.clear()
+
+                if added_embeddings:
+                    st.session_state.admin_face_feedback = {
+                        "level": "success",
+                        "message": (
+                            f"Training complete. Added {added_embeddings} new embedding(s). "
+                            "Existing users were preserved, and processed source images were "
+                            "deleted from known_faces."
+                        ),
+                    }
+                else:
+                    st.session_state.admin_face_feedback = {
+                        "level": "warning",
+                        "message": (
+                            "Training finished, but no new embeddings were created. "
+                            "The pending images were kept so you can review them."
+                        ),
+                    }
+
+                st.rerun()
+
+        # ─── 2. ATTENDANCE ────────────────────────────────────────────
+        with admin_tab2:
+            st.markdown("#### 📋 Attendance Records")
+
+            col_d1, col_d2 = st.columns([2, 1])
+            with col_d1:
+                selected_date = st.date_input("Select Date", datetime.now())
+            with col_d2:
+                show_all = st.checkbox("Show all dates")
+
+            if show_all:
+                records = db.get_all_attendance()
+                st.markdown(f"**All Records** ({len(records)} total)")
+            else:
+                date_str = selected_date.strftime("%Y-%m-%d")
+                records = db.get_attendance(date_str)
+                st.markdown(f"**{date_str}** — {len(records)} entries")
+
+            if records:
+                table_html = '<table class="attendance-table"><tr>'
+                table_html += '<th>#</th><th>Name</th><th>Date</th><th>Time</th><th>Confidence</th></tr>'
+                for i, r in enumerate(records, 1):
+                    conf = f"{r['confidence'] * 100:.1f}%" if r['confidence'] else "N/A"
+                    table_html += f"<tr><td>{i}</td><td>{r['name']}</td><td>{r['date']}</td>"
+                    table_html += f"<td>{r['time']}</td><td>{conf}</td></tr>"
+                table_html += '</table>'
+                st.markdown(table_html, unsafe_allow_html=True)
+            else:
+                st.info("No attendance records found for this date.")
+
+        # ─── 3. PASSWORD ─────────────────────────────────────────────
+        with admin_tab3:
+            st.markdown("#### 🔑 Change Admin Password")
+
+            with st.form("change_password"):
+                new_pass = st.text_input("New Password", type="password")
+                confirm_pass = st.text_input("Confirm Password", type="password")
+                change_btn = st.form_submit_button("🔄 Change Password", type="primary")
+
+            if change_btn:
+                if not new_pass or len(new_pass) < 4:
+                    st.error("Password must be at least 4 characters.")
+                elif new_pass != confirm_pass:
+                    st.error("Passwords do not match!")
+                else:
+                    security.set_admin_password(new_pass)
+                    st.success("✅ Admin password changed successfully!")
+
+        # ─── 4. UNKNOWN FACES ────────────────────────────────────────
+        with admin_tab4:
+            st.markdown("#### 👤 Captured Unknown Faces")
+
+            unknown_dir = config.UNKNOWN_FACES_DIR
+            if os.path.exists(unknown_dir):
+                images = sorted(glob.glob(os.path.join(unknown_dir, "*.jpg")), reverse=True)
+
+                if images:
+                    st.markdown(f"**{len(images)} unknown face captures**")
+
+                    cols_per_row = 4
+                    for i in range(0, len(images), cols_per_row):
+                        cols = st.columns(cols_per_row)
+                        for j, col in enumerate(cols):
+                            idx = i + j
+                            if idx < len(images):
+                                img_path = images[idx]
+                                filename = os.path.basename(img_path)
+                                with col:
+                                    img = cv2.imread(img_path)
+                                    if img is not None:
+                                        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                                        st.image(img_rgb, caption=filename)
+
+                    st.markdown("---")
+                    if st.button("🗑️ Delete All Unknown Faces", type="secondary"):
+                        for img in images:
+                            try:
+                                os.remove(img)
+                            except Exception:
+                                pass
+                        st.success(f"Deleted {len(images)} images.")
+                        st.rerun()
+                else:
+                    st.info("No unknown face captures found.")
+            else:
+                st.info("Unknown faces directory does not exist yet.")
+
+        # ─── 5. DIGITAL THEFT ─────────────────────────────────────────
+        with admin_tab5:
+            st.markdown("#### 🚨 Digital Theft — Spoofing Attempts")
+            st.markdown("Images captured when someone **failed the depth/motion check** "
+                        "(screen replay, photo, or video spoofing detected).")
+
+            theft_dir = config.DIGITAL_THEFT_DIR
+            if os.path.exists(theft_dir):
+                theft_images = sorted(
+                    glob.glob(os.path.join(theft_dir, "*.jpg")), reverse=True
+                )
+
+                if theft_images:
+                    st.error(f"⚠️ **{len(theft_images)} spoofing attempt(s) detected!**")
+
+                    cols_per_row = 3
+                    for i in range(0, len(theft_images), cols_per_row):
+                        cols = st.columns(cols_per_row)
+                        for j, col in enumerate(cols):
+                            idx = i + j
+                            if idx < len(theft_images):
+                                img_path = theft_images[idx]
+                                filename = os.path.basename(img_path)
+                                # Parse info from filename: spoof_Name_20260407_120000.jpg
+                                parts = filename.replace(".jpg", "").split("_")
+                                who = parts[1] if len(parts) > 1 else "Unknown"
+                                when = ""
+                                if len(parts) >= 4:
+                                    when = f"{parts[2][:4]}-{parts[2][4:6]}-{parts[2][6:]} {parts[3][:2]}:{parts[3][2:4]}:{parts[3][4:]}"
+
+                                with col:
+                                    img = cv2.imread(img_path)
+                                    if img is not None:
+                                        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                                        st.image(img_rgb, caption=f"🚨 {who}")
+                                        if when:
+                                            st.caption(f"📅 {when}")
+
+                    st.markdown("---")
+                    col_del1, col_del2 = st.columns([1, 3])
+                    with col_del1:
+                        if st.button("🗑️ Delete All", type="secondary", key="del_theft"):
+                            for img in theft_images:
+                                try:
+                                    os.remove(img)
+                                except Exception:
+                                    pass
+                            st.success(f"Deleted {len(theft_images)} spoofing images.")
+                            st.rerun()
+                else:
+                    st.success("✅ No spoofing attempts detected. All clear!")
+            else:
+                st.success("✅ No spoofing attempts detected. All clear!")
+
+        # ─── 6. UNLOCK ───────────────────────────────────────────────
+        with admin_tab6:
+            st.markdown("#### 🔓 System Lock Control")
+
+            sec_status = security.get_status()
+
+            if sec_status["locked"]:
+                st.error(f"🔒 System is **LOCKED** — {sec_status['failed_attempts']} failed attempts")
+                if st.button("🔓 Unlock System", type="primary"):
+                    security.locked = False
+                    security.failed_attempts = 0
+                    security.lock_time = None
+                    security._save_lock_state()
+                    st.success("✅ System unlocked!")
+                    st.rerun()
+            else:
+                st.success(f"🔓 System is unlocked. Failed attempts: "
+                           f"{sec_status['failed_attempts']}/{sec_status['max_attempts']}")
+
+            if sec_status["failed_attempts"] > 0 and not sec_status["locked"]:
+                if st.button("Reset Failed Attempts Counter"):
+                    security.failed_attempts = 0
+                    security._save_lock_state()
+                    st.success("Counter reset to 0.")
+                    st.rerun()
+
+            st.markdown("---")
+            st.markdown("#### 📝 Log Integrity Check")
+            if st.button("🔍 Verify Log Integrity"):
+                result = log.verify_integrity()
+                if result["valid"]:
+                    st.success(f"✅ {result['details']}")
+                else:
+                    st.error(f"❌ INTEGRITY VIOLATION: {result['details']}")
+
+
+// database.py
+
+"""
+SQLite Attendance Database.
+Stores only valid (access granted) entries.
+Enforces unique constraint: one entry per person per day.
+"""
+
+import sqlite3
+import os
+from datetime import datetime
+import config
+
+
+class AttendanceDB:
+    """Thread-safe SQLite attendance logger."""
+
+    def __init__(self):
+        os.makedirs(config.DATA_DIR, exist_ok=True)
+        self.db_path = config.DATABASE_FILE
+        self._init_db()
+
+    def _init_db(self):
+        """Create the attendance table if it doesn't exist."""
+        conn = self._connect()
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS attendance (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                date TEXT NOT NULL,
+                time TEXT NOT NULL,
+                confidence REAL,
+                UNIQUE(name, date)
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+    def _connect(self):
+        return sqlite3.connect(self.db_path)
+
+    def log_attendance(self, name: str, confidence: float = 0.0) -> bool:
+        """
+        Log attendance for a user.
+        Returns True if entry was inserted, False if duplicate (already logged today).
+        """
+        now = datetime.now()
+        date_str = now.strftime("%Y-%m-%d")
+        time_str = now.strftime("%H:%M:%S")
+
+        conn = self._connect()
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute(
+                "INSERT OR IGNORE INTO attendance (name, date, time, confidence) VALUES (?, ?, ?, ?)",
+                (name, date_str, time_str, round(confidence, 4))
+            )
+            conn.commit()
+            inserted = cursor.rowcount > 0
+
+            if inserted:
+                print(f"[DB] Attendance logged: {name} at {time_str} on {date_str}")
+            else:
+                print(f"[DB] Duplicate: {name} already logged for {date_str}")
+
+            return inserted
+        except Exception as e:
+            print(f"[DB] Error logging attendance: {e}")
+            return False
+        finally:
+            conn.close()
+
+    def get_attendance(self, date: str = None) -> list:
+        """
+        Get attendance records.
+        If date is None, returns today's records.
+        """
+        if date is None:
+            date = datetime.now().strftime("%Y-%m-%d")
+
+        conn = self._connect()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT name, date, time, confidence FROM attendance WHERE date = ? ORDER BY time",
+            (date,)
+        )
+        records = cursor.fetchall()
+        conn.close()
+
+        return [
+            {"name": r[0], "date": r[1], "time": r[2], "confidence": r[3]}
+            for r in records
+        ]
+
+    def get_all_attendance(self) -> list:
+        """Get all attendance records."""
+        conn = self._connect()
+        cursor = conn.cursor()
+        cursor.execute("SELECT name, date, time, confidence FROM attendance ORDER BY date DESC, time DESC")
+        records = cursor.fetchall()
+        conn.close()
+
+        return [
+            {"name": r[0], "date": r[1], "time": r[2], "confidence": r[3]}
+            for r in records
+        ]
+
+    def get_count(self, date: str = None) -> int:
+        """Get attendance count for a date."""
+        if date is None:
+            date = datetime.now().strftime("%Y-%m-%d")
+
+        conn = self._connect()
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM attendance WHERE date = ?", (date,))
+        count = cursor.fetchone()[0]
+        conn.close()
+        return count
+
+
+// config.py
+
+"""
+Configuration for the Advanced Face Recognition System.
+All tuneable parameters are centralized here.
+"""
+
+import os
+
+# ─── Base Paths ───────────────────────────────────────────────────────────────
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+KNOWN_FACES_DIR = os.path.join(BASE_DIR, "known_faces")
+ENCODINGS_DIR = os.path.join(BASE_DIR, "encodings")
+UNKNOWN_FACES_DIR = os.path.join(BASE_DIR, "unknown_faces")
+DIGITAL_THEFT_DIR = os.path.join(BASE_DIR, "digital_theft")
+LOGS_DIR = os.path.join(BASE_DIR, "logs")
+DATA_DIR = os.path.join(BASE_DIR, "data")
+
+# ─── File Paths ───────────────────────────────────────────────────────────────
+ENCODINGS_FILE = os.path.join(ENCODINGS_DIR, "face_encodings.pkl")
+DATABASE_FILE = os.path.join(DATA_DIR, "attendance.db")
+ACCESS_LOG_FILE = os.path.join(LOGS_DIR, "access_log.jsonl")
+REVIEW_QUEUE_FILE = os.path.join(DATA_DIR, "review_queue.pkl")
+ADMIN_PASSWORD_FILE = os.path.join(DATA_DIR, "admin.key")
+LOCK_STATE_FILE = os.path.join(DATA_DIR, "lock_state.json")
+
+# ─── Recognition ──────────────────────────────────────────────────────────────
+CONFIDENCE_THRESHOLD = 0.60          # Minimum confidence to grant access (60%)
+FACE_RECOGNITION_MODEL = "hog"       # "hog" (CPU) or "cnn" (GPU) — fully offline
+FACE_ENCODING_JITTERS = 1            # Number of re-samples for encoding (higher = slower but better)
+
+# ─── Liveness Detection ──────────────────────────────────────────────────────
+REQUIRED_BLINKS = 2                  # Number of blinks required to confirm liveness
+EAR_THRESHOLD = 0.21                 # Eye Aspect Ratio below this = eye closed
+EAR_CONSECUTIVE_FRAMES = 2           # Frames the eye must be below threshold to count as blink
+LIVENESS_TIMEOUT = 20                # Seconds to complete blink challenge
+
+# ─── Unknown Face Handling ────────────────────────────────────────────────────
+UNKNOWN_CAPTURE_INTERVAL = 10        # Seconds between unknown face captures
+UNKNOWN_TIMEOUT = 50                 # Seconds before full session reset
+
+# ─── Security & Anti-Spoofing ─────────────────────────────────────────────────
+MAX_FAILED_ATTEMPTS = 5              # Failed attempts before LOCK MODE
+DEFAULT_ADMIN_PASSWORD = "admin123"  # Default admin password (change on first run!)
+
+# ─── Low-Light Preprocessing (Multi-Level) ───────────────────────────────────
+GAMMA_VALUE = 1.8                    # Base gamma correction value
+CLAHE_CLIP_LIMIT = 3.0               # Default CLAHE clip limit
+CLAHE_GRID_SIZE = (8, 8)             # Default CLAHE grid size
+NOISE_REDUCTION_STRENGTH = 5         # Strength of non-local means denoising
+LOW_LIGHT_PITCH_BLACK = 15           # Avg brightness < 15 → near invisible
+LOW_LIGHT_VERY_DARK = 40             # Avg brightness < 40 → barely see shapes
+LOW_LIGHT_DARK = 70                  # Avg brightness < 70 → dim
+LOW_LIGHT_DIM = 100                  # Avg brightness < 100 → slightly below normal
+LOW_LIGHT_THRESHOLD = 100            # Legacy alias (kept for compatibility)
+
+# ─── Depth / Motion Anti-Spoofing ────────────────────────────────────────────
+DEPTH_CHECK_ENABLED = True           # Toggle depth/motion check on/off
+DEPTH_TASKS_COUNT = 2                # Number of random tasks per session
+DEPTH_TASK_TIMEOUT = 5               # Seconds per task to perform movement
+DEPTH_SIZE_CHANGE_THRESHOLD = 0.12   # 12% face area change required (move closer/away)
+DEPTH_POSITION_SHIFT_THRESHOLD = 10  # Pixels of nose shift required (turn/look)
+DEPTH_ANGLE_CHANGE_THRESHOLD = 4     # Degrees of eye-line tilt required
+
+# ─── Adaptive Learning ───────────────────────────────────────────────────────
+ADAPTIVE_LOW_THRESHOLD = 0.40        # Matches between 40%–60% go to review queue
+ADAPTIVE_HIGH_THRESHOLD = 0.60       # Same as CONFIDENCE_THRESHOLD
+
+# ─── Camera ───────────────────────────────────────────────────────────────────
+CAMERA_INDEX = 0                     # Default camera index
+FRAME_WIDTH = 640                    # Capture width
+FRAME_HEIGHT = 480                   # Capture height
+PROCESS_EVERY_N_FRAMES = 2           # Skip frames for performance
+
+# ─── Ensure directories exist ─────────────────────────────────────────────────
+for _dir in [KNOWN_FACES_DIR, ENCODINGS_DIR, UNKNOWN_FACES_DIR, DIGITAL_THEFT_DIR, LOGS_DIR, DATA_DIR]:
+    os.makedirs(_dir, exist_ok=True)
+
+
+// depth_motion_check.py
+
+"""
+Depth & Motion Anti-Spoofing — Random Task Verification.
+Asks the user to perform random physical movements and verifies
+that face metrics change in ways consistent with a real 3D person,
+not a flat screen replay.
+
+Uses MediaPipe Face Mesh (fully offline).
+Uses pyttsx3 for offline text-to-speech announcements.
+"""
+
+import cv2
+import math
+import time
+import random
+import threading
+import numpy as np
+import mediapipe as mp
+import pyttsx3
+import config
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Text-to-Speech Engine (non-blocking)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_tts_lock = threading.Lock()
+
+
+def _speak_async(text: str):
+    """
+    Speak text aloud in a background thread so the camera loop
+    doesn't freeze while the voice plays.
+    """
+    def _run():
+        with _tts_lock:
+            try:
+                engine = pyttsx3.init()
+                engine.setProperty('rate', 160)   # slightly slower for clarity
+                engine.setProperty('volume', 1.0)
+                engine.say(text)
+                engine.runAndWait()
+                engine.stop()
+            except Exception as e:
+                print(f"[TTS] Speech error (non-fatal): {e}")
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Task Definitions
+# ═══════════════════════════════════════════════════════════════════════════════
+
+TASKS = [
+    {
+        "id": "move_closer",
+        "instruction": "Move your face CLOSER to the camera",
+        "icon": "🔍",
+        "metric": "face_area",
+        "expected_direction": "increase",
+        "description": "Face should get bigger",
+    },
+    {
+        "id": "move_away",
+        "instruction": "Move your face AWAY from the camera",
+        "icon": "🔭",
+        "metric": "face_area",
+        "expected_direction": "decrease",
+        "description": "Face should get smaller",
+    },
+    {
+        "id": "turn_left",
+        "instruction": "Turn your head to the LEFT",
+        "icon": "👈",
+        "metric": "nose_x",
+        "expected_direction": "increase",   # webcam mirrors — user's left = image right
+        "description": "Nose shifts right in mirrored view",
+    },
+    {
+        "id": "turn_right",
+        "instruction": "Turn your head to the RIGHT",
+        "icon": "👉",
+        "metric": "nose_x",
+        "expected_direction": "decrease",   # webcam mirrors — user's right = image left
+        "description": "Nose shifts left in mirrored view",
+    },
+    {
+        "id": "look_up",
+        "instruction": "Look UP slowly",
+        "icon": "👆",
+        "metric": "nose_y",
+        "expected_direction": "decrease",
+        "description": "Nose should shift up",
+    },
+    {
+        "id": "look_down",
+        "instruction": "Look DOWN slowly",
+        "icon": "👇",
+        "metric": "nose_y",
+        "expected_direction": "increase",
+        "description": "Nose should shift down",
+    },
+    {
+        "id": "tilt_left",
+        "instruction": "Tilt your head to your LEFT SHOULDER",
+        "icon": "↩️",
+        "metric": "eye_angle",
+        "expected_direction": "any",        # accept tilt in either direction
+        "description": "Eye line should tilt",
+    },
+    {
+        "id": "tilt_right",
+        "instruction": "Tilt your head to your RIGHT SHOULDER",
+        "icon": "↪️",
+        "metric": "eye_angle",
+        "expected_direction": "any",        # accept tilt in either direction
+        "description": "Eye line should tilt",
+    },
+]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Face Metrics Extraction
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# MediaPipe Face Mesh key landmarks
+NOSE_TIP = 1
+LEFT_EYE_OUTER = 263
+RIGHT_EYE_OUTER = 33
+FOREHEAD = 10
+CHIN = 152
+LEFT_CHEEK = 234
+RIGHT_CHEEK = 454
+
+
+class FaceMetrics:
+    """Extract relevant metrics from MediaPipe Face Mesh landmarks."""
+
+    def __init__(self):
+        self.mp_face_mesh = mp.solutions.face_mesh
+        self.face_mesh = self.mp_face_mesh.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+
+    def extract(self, frame) -> dict:
+        """
+        Extract face metrics from a frame.
+
+        Returns dict with:
+            face_detected: bool
+            face_area: float  (bounding box area as fraction of frame)
+            nose_x: float     (nose tip X as fraction of frame width)
+            nose_y: float     (nose tip Y as fraction of frame height)
+            eye_angle: float  (angle of line between outer eye corners, degrees)
+            face_width: float (cheek-to-cheek distance as fraction of frame width)
+            face_height: float (forehead-to-chin distance as fraction of frame height)
+            landmarks: list   (raw landmark data)
+        """
+        h, w = frame.shape[:2]
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self.face_mesh.process(rgb)
+
+        if not results.multi_face_landmarks:
+            return {"face_detected": False}
+
+        face = results.multi_face_landmarks[0].landmark
+
+        # Nose tip position (normalised 0-1)
+        nose_x = face[NOSE_TIP].x
+        nose_y = face[NOSE_TIP].y
+
+        # Eye outer corners for angle calculation
+        left_eye = (face[LEFT_EYE_OUTER].x * w, face[LEFT_EYE_OUTER].y * h)
+        right_eye = (face[RIGHT_EYE_OUTER].x * w, face[RIGHT_EYE_OUTER].y * h)
+
+        dx = left_eye[0] - right_eye[0]
+        dy = left_eye[1] - right_eye[1]
+        eye_angle = math.degrees(math.atan2(dy, dx))
+
+        # Face bounding box from cheeks and forehead/chin
+        forehead_y = face[FOREHEAD].y
+        chin_y = face[CHIN].y
+        left_cheek_x = face[LEFT_CHEEK].x
+        right_cheek_x = face[RIGHT_CHEEK].x
+
+        face_width = abs(left_cheek_x - right_cheek_x)
+        face_height = abs(chin_y - forehead_y)
+        face_area = face_width * face_height  # normalised (fraction of frame)
+
+        return {
+            "face_detected": True,
+            "face_area": face_area,
+            "nose_x": nose_x,
+            "nose_y": nose_y,
+            "eye_angle": eye_angle,
+            "face_width": face_width,
+            "face_height": face_height,
+        }
+
+    def release(self):
+        """Release MediaPipe resources."""
+        self.face_mesh.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Depth / Motion Checker — State Machine
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class DepthMotionChecker:
+    """
+    Random-task-based depth & motion anti-spoofing.
+
+    Usage:
+        checker = DepthMotionChecker()
+        checker.start_session()           # picks random tasks
+
+        while not checker.is_complete():
+            metrics = checker.process_frame(frame)  # feed frames
+            task_info = checker.get_current_task_info()
+            # draw task_info["instruction"] on screen
+
+        result = checker.get_result()     # {"passed": bool, "details": [...]}
+        checker.release()
+    """
+
+    # States
+    IDLE = "IDLE"
+    BASELINE = "BASELINE"           # Collecting baseline metrics (1s)
+    TASK_ACTIVE = "TASK_ACTIVE"     # User performing task
+    MEASURING = "MEASURING"         # Evaluating result
+    TASK_DONE = "TASK_DONE"         # Single task evaluated
+    ALL_DONE = "ALL_DONE"           # All tasks completed
+
+    def __init__(self):
+        self.face_metrics = FaceMetrics()
+        self.state = self.IDLE
+        self.selected_tasks = []
+        self.current_task_idx = 0
+        self.task_results = []
+
+        # Timing
+        self.baseline_start = 0
+        self.task_start = 0
+
+        # Metrics buffers
+        self.baseline_samples = []
+        self.task_samples = []
+
+        # Config
+        self.num_tasks = config.DEPTH_TASKS_COUNT
+        self.task_timeout = config.DEPTH_TASK_TIMEOUT
+        self.baseline_duration = 1.5  # seconds to collect baseline
+
+    def start_session(self):
+        """Pick random tasks and begin the verification session."""
+        # Select N non-conflicting random tasks
+        self.selected_tasks = self._pick_random_tasks(self.num_tasks)
+        self.current_task_idx = 0
+        self.task_results = []
+        self.state = self.BASELINE
+        self.baseline_start = time.time()
+        self.baseline_samples = []
+        self.task_samples = []
+        print(f"[DEPTH] Session started — {self.num_tasks} tasks selected")
+        for t in self.selected_tasks:
+            print(f"  → {t['icon']} {t['instruction']}")
+
+        # Announce start via TTS
+        _speak_async("Depth verification starting. Hold still for baseline.")
+
+    def _pick_random_tasks(self, count: int) -> list:
+        """
+        Pick `count` non-conflicting random tasks.
+        Avoid picking both 'move_closer' and 'move_away' etc.
+        """
+        conflict_pairs = [
+            ("move_closer", "move_away"),
+            ("turn_left", "turn_right"),
+            ("look_up", "look_down"),
+            ("tilt_left", "tilt_right"),
+        ]
+
+        available = list(TASKS)
+        selected = []
+
+        for _ in range(count):
+            if not available:
+                break
+            task = random.choice(available)
+            selected.append(task)
+            available.remove(task)
+
+            # Remove conflicting task
+            for pair in conflict_pairs:
+                if task["id"] in pair:
+                    conflict_id = pair[0] if task["id"] == pair[1] else pair[1]
+                    available = [t for t in available if t["id"] != conflict_id]
+
+        return selected
+
+    def process_frame(self, frame) -> dict:
+        """
+        Process a single frame. Call this every frame during verification.
+
+        Returns current metrics dict (or empty if no face).
+        """
+        if self.state in (self.IDLE, self.ALL_DONE):
+            return {}
+
+        metrics = self.face_metrics.extract(frame)
+        if not metrics.get("face_detected", False):
+            return metrics
+
+        now = time.time()
+
+        # ── BASELINE COLLECTION ──
+        if self.state == self.BASELINE:
+            self.baseline_samples.append(metrics)
+            if now - self.baseline_start >= self.baseline_duration:
+                # Transition to TASK_ACTIVE
+                self.state = self.TASK_ACTIVE
+                self.task_start = time.time()
+                self.task_samples = []
+                task = self.selected_tasks[self.current_task_idx]
+                print(f"[DEPTH] Baseline collected ({len(self.baseline_samples)} samples)")
+                print(f"[DEPTH] Task {self.current_task_idx + 1}: {task['instruction']}")
+
+                # 🔊 SPEAK the instruction aloud
+                _speak_async(task["instruction"])
+
+        # ── TASK ACTIVE — collecting movement samples ──
+        elif self.state == self.TASK_ACTIVE:
+            self.task_samples.append(metrics)
+
+            # Check timeout
+            if now - self.task_start >= self.task_timeout:
+                self.state = self.MEASURING
+
+        # ── MEASURING — evaluate the completed task ──
+        if self.state == self.MEASURING:
+            result = self._evaluate_task(
+                self.selected_tasks[self.current_task_idx],
+                self.baseline_samples,
+                self.task_samples,
+            )
+            self.task_results.append(result)
+            print(f"[DEPTH] Task {self.current_task_idx + 1} result: "
+                  f"{'✅ PASS' if result['passed'] else '❌ FAIL'} — {result['reason']}")
+
+            # Advance to next task or finish
+            self.current_task_idx += 1
+            if self.current_task_idx >= len(self.selected_tasks):
+                self.state = self.ALL_DONE
+                print(f"[DEPTH] All tasks done. Overall: "
+                      f"{'PASS' if self.is_passed() else 'FAIL'}")
+            else:
+                # Collect new baseline for next task
+                self.state = self.BASELINE
+                self.baseline_start = time.time()
+                self.baseline_samples = []
+                self.task_samples = []
+
+        return metrics
+
+    def _evaluate_task(self, task: dict, baseline: list, samples: list) -> dict:
+        """
+        Compare baseline metrics to task-period metrics.
+        Determine if the change is consistent with a real person.
+        """
+        if not baseline or not samples:
+            return {"task": task["id"], "passed": False,
+                    "reason": "Insufficient data"}
+
+        metric_key = task["metric"]
+        direction = task["expected_direction"]
+
+        # Extract metric values
+        baseline_vals = [s[metric_key] for s in baseline if metric_key in s]
+        task_vals = [s[metric_key] for s in samples if metric_key in s]
+
+        if not baseline_vals or not task_vals:
+            return {"task": task["id"], "passed": False,
+                    "reason": "No face metrics captured"}
+
+        baseline_mean = np.mean(baseline_vals)
+        baseline_std = np.std(baseline_vals)
+
+        # Use the peak (most extreme) value during the task to catch the movement
+        if direction == "increase":
+            task_peak = np.max(task_vals)
+            change = task_peak - baseline_mean
+        else:
+            task_peak = np.min(task_vals)
+            change = baseline_mean - task_peak
+
+        # Determine threshold based on metric type
+        if metric_key == "face_area":
+            # Face area is normalised (fraction of frame), ~0.02 - 0.15
+            threshold = config.DEPTH_SIZE_CHANGE_THRESHOLD * baseline_mean
+            abs_change = abs(task_peak - baseline_mean)
+            passed = change > 0 and abs_change >= threshold
+            reason = (f"Area: baseline={baseline_mean:.4f}, "
+                      f"peak={task_peak:.4f}, change={abs_change:.4f}, "
+                      f"threshold={threshold:.4f}")
+
+        elif metric_key in ("nose_x", "nose_y"):
+            # Nose position is normalised 0-1
+            threshold = config.DEPTH_POSITION_SHIFT_THRESHOLD / 640.0  # convert pixels to normalised
+            abs_change = abs(task_peak - baseline_mean)
+            passed = change > 0 and abs_change >= threshold
+            reason = (f"Nose: baseline={baseline_mean:.4f}, "
+                      f"peak={task_peak:.4f}, shift={abs_change:.4f}, "
+                      f"threshold={threshold:.4f}")
+
+        elif metric_key == "eye_angle":
+            # Eye angle in degrees — use absolute change (tilt either way counts)
+            threshold = config.DEPTH_ANGLE_CHANGE_THRESHOLD
+            # For tilt, check max deviation in EITHER direction from baseline
+            max_val = float(np.max(task_vals))
+            min_val = float(np.min(task_vals))
+            abs_change = max(abs(max_val - baseline_mean), abs(baseline_mean - min_val))
+            passed = abs_change >= threshold  # any direction counts
+            reason = (f"Angle: baseline={baseline_mean:.1f}°, "
+                      f"max={max_val:.1f}°, min={min_val:.1f}°, change={abs_change:.1f}°, "
+                      f"threshold={threshold}°")
+        else:
+            passed = False
+            reason = f"Unknown metric: {metric_key}"
+
+        return {
+            "task": task["id"],
+            "passed": passed,
+            "reason": reason,
+            "change": float(abs(task_peak - baseline_mean)),
+        }
+
+    # ─── Status Queries ───────────────────────────────────────────────────────
+
+    def is_complete(self) -> bool:
+        """All tasks have been evaluated."""
+        return self.state == self.ALL_DONE
+
+    def is_passed(self) -> bool:
+        """Did the user pass ALL tasks?"""
+        if not self.task_results:
+            return False
+        return all(r["passed"] for r in self.task_results)
+
+    def get_result(self) -> dict:
+        """Get final verification result."""
+        return {
+            "passed": self.is_passed(),
+            "tasks_completed": len(self.task_results),
+            "tasks_required": len(self.selected_tasks),
+            "details": self.task_results,
+        }
+
+    def get_current_task_info(self) -> dict:
+        """
+        Get info about the current task (for UI display).
+
+        Returns dict with:
+            state: current state string
+            task_index: 0-based index of current task
+            total_tasks: total number of tasks
+            instruction: text to show the user
+            icon: emoji icon
+            time_remaining: seconds left for current task
+            progress: list of completed task results
+        """
+        if self.state == self.IDLE:
+            return {"state": self.IDLE, "instruction": "Waiting to start..."}
+
+        if self.state == self.ALL_DONE:
+            return {
+                "state": self.ALL_DONE,
+                "instruction": "Verification complete!",
+                "passed": self.is_passed(),
+                "progress": self.task_results,
+            }
+
+        task = self.selected_tasks[self.current_task_idx]
+        now = time.time()
+
+        if self.state == self.BASELINE:
+            remaining = max(0, self.baseline_duration - (now - self.baseline_start))
+            return {
+                "state": self.BASELINE,
+                "task_index": self.current_task_idx,
+                "total_tasks": len(self.selected_tasks),
+                "instruction": "Hold still... capturing baseline",
+                "icon": "📷",
+                "time_remaining": remaining,
+                "progress": self.task_results,
+            }
+
+        if self.state == self.TASK_ACTIVE:
+            remaining = max(0, self.task_timeout - (now - self.task_start))
+            return {
+                "state": self.TASK_ACTIVE,
+                "task_index": self.current_task_idx,
+                "total_tasks": len(self.selected_tasks),
+                "instruction": task["instruction"],
+                "icon": task["icon"],
+                "time_remaining": remaining,
+                "progress": self.task_results,
+            }
+
+        return {
+            "state": self.state,
+            "task_index": self.current_task_idx,
+            "total_tasks": len(self.selected_tasks),
+            "instruction": "Processing...",
+            "icon": "⏳",
+            "time_remaining": 0,
+            "progress": self.task_results,
+        }
+
+    def reset(self):
+        """Reset to idle state."""
+        self.state = self.IDLE
+        self.selected_tasks = []
+        self.current_task_idx = 0
+        self.task_results = []
+        self.baseline_samples = []
+        self.task_samples = []
+
+    def release(self):
+        """Release MediaPipe resources."""
+        self.face_metrics.release()
+
+
+// unknown_handler.py
+
+"""
+Unknown Face Handler.
+Tracks unknown faces, captures images periodically, and times out.
+"""
+
+import os
+import time
+import cv2
+from datetime import datetime
+import config
+
+
+class UnknownFaceHandler:
+    """Manages unknown face tracking and image capture."""
+
+    def __init__(self):
+        os.makedirs(config.UNKNOWN_FACES_DIR, exist_ok=True)
+        # Track unknown faces by approximate location hash
+        self._trackers = {}  # {face_key: {"first_seen": time, "last_capture": time}}
+
+    def _face_key(self, face_location) -> str:
+        """Generate a rough key for a face based on its location."""
+        if face_location is None:
+            return "none"
+        top, right, bottom, left = face_location
+        # Quantize to reduce sensitivity to small movements
+        return f"{top // 50}_{left // 50}"
+
+    def process_unknown(self, frame, face_location) -> dict:
+        """
+        Process an unknown face detection.
+
+        Returns dict:
+            {
+                "status": "tracking" | "captured" | "timed_out",
+                "time_remaining": float,
+                "captures": int
+            }
+        """
+        key = self._face_key(face_location)
+        now = time.time()
+
+        if key not in self._trackers:
+            self._trackers[key] = {
+                "first_seen": now,
+                "last_capture": 0,
+                "captures": 0
+            }
+
+        tracker = self._trackers[key]
+        elapsed = now - tracker["first_seen"]
+        time_remaining = max(0, config.UNKNOWN_TIMEOUT - elapsed)
+
+        # Timeout — stop tracking
+        if elapsed >= config.UNKNOWN_TIMEOUT:
+            self._trackers.pop(key, None)
+            return {
+                "status": "timed_out",
+                "time_remaining": 0,
+                "captures": tracker["captures"]
+            }
+
+        # Capture every UNKNOWN_CAPTURE_INTERVAL seconds
+        since_last_capture = now - tracker["last_capture"]
+        if since_last_capture >= config.UNKNOWN_CAPTURE_INTERVAL:
+            self._capture_image(frame, face_location)
+            tracker["last_capture"] = now
+            tracker["captures"] += 1
+            return {
+                "status": "captured",
+                "time_remaining": time_remaining,
+                "captures": tracker["captures"]
+            }
+
+        return {
+            "status": "tracking",
+            "time_remaining": time_remaining,
+            "captures": tracker["captures"]
+        }
+
+    def _capture_image(self, frame, face_location):
+        """Save an unknown face image to disk."""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"unknown_{timestamp}.jpg"
+        filepath = os.path.join(config.UNKNOWN_FACES_DIR, filename)
+
+        # Crop face with some padding
+        if face_location is not None:
+            top, right, bottom, left = face_location
+            h, w = frame.shape[:2]
+            pad = 30
+            top = max(0, top - pad)
+            left = max(0, left - pad)
+            bottom = min(h, bottom + pad)
+            right = min(w, right + pad)
+            face_img = frame[top:bottom, left:right]
+        else:
+            face_img = frame
+
+        cv2.imwrite(filepath, face_img)
+        print(f"[UNKNOWN] Captured unknown face: {filename}")
+
+    def reset(self):
+        """Clear all trackers."""
+        self._trackers.clear()
+
+    def get_active_count(self) -> int:
+        """Get number of currently tracked unknown faces."""
+        # Clean up expired trackers
+        now = time.time()
+        expired = [k for k, v in self._trackers.items()
+                   if now - v["first_seen"] >= config.UNKNOWN_TIMEOUT]
+        for k in expired:
+            del self._trackers[k]
+        return len(self._trackers)
+
+
+// tamper_proof_log.py
+
+"""
+Tamper-Proof Logging System.
+Append-only log with SHA-256 hash chaining.
+Any modification to past entries breaks the chain → detectable.
+"""
+
+import os
+import json
+import hashlib
+from datetime import datetime
+import config
+
+
+class TamperProofLog:
+    """Hash-chained append-only log for access events."""
+
+    def __init__(self):
+        os.makedirs(config.LOGS_DIR, exist_ok=True)
+        self.log_file = config.ACCESS_LOG_FILE
+        self._last_hash = self._get_last_hash()
+
+    def _get_last_hash(self) -> str:
+        """Get the hash of the last log entry, or genesis hash."""
+        if not os.path.exists(self.log_file):
+            return "0" * 64  # Genesis hash
+
+        try:
+            with open(self.log_file, "r") as f:
+                lines = f.readlines()
+                if not lines:
+                    return "0" * 64
+
+                last_line = lines[-1].strip()
+                if last_line:
+                    entry = json.loads(last_line)
+                    return entry.get("hash", "0" * 64)
+        except (json.JSONDecodeError, KeyError):
+            return "0" * 64
+
+        return "0" * 64
+
+    def _compute_hash(self, content: str, prev_hash: str) -> str:
+        """Compute SHA-256 hash of content + previous hash."""
+        data = f"{prev_hash}{content}"
+        return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+    def append_log(self, event: str, name: str = "", confidence: float = 0.0,
+                   details: str = "") -> dict:
+        """
+        Append a new log entry with hash chaining.
+
+        Args:
+            event: Event type (e.g., "ACCESS_GRANTED", "ACCESS_DENIED", "SYSTEM_LOCKED")
+            name: Person name (if applicable)
+            confidence: Recognition confidence (if applicable)
+            details: Additional details
+
+        Returns:
+            The log entry dict
+        """
+        now = datetime.now()
+        timestamp = now.isoformat()
+
+        # Build content string for hashing (excludes hash fields)
+        content = f"{timestamp}|{event}|{name}|{confidence:.4f}|{details}"
+
+        # Compute chained hash
+        entry_hash = self._compute_hash(content, self._last_hash)
+
+        entry = {
+            "timestamp": timestamp,
+            "event": event,
+            "name": name,
+            "confidence": round(confidence, 4),
+            "details": details,
+            "prev_hash": self._last_hash,
+            "hash": entry_hash
+        }
+
+        # Append to log file
+        with open(self.log_file, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+
+        self._last_hash = entry_hash
+        print(f"[LOG] {event}: {name} ({confidence:.1%}) — {details}")
+
+        return entry
+
+    def verify_integrity(self) -> dict:
+        """
+        Verify the integrity of the entire log chain.
+
+        Returns dict:
+            {
+                "valid": bool,
+                "total_entries": int,
+                "first_broken_at": int or None,
+                "details": str
+            }
+        """
+        if not os.path.exists(self.log_file):
+            return {
+                "valid": True,
+                "total_entries": 0,
+                "first_broken_at": None,
+                "details": "No log file exists yet."
+            }
+
+        with open(self.log_file, "r") as f:
+            lines = f.readlines()
+
+        if not lines:
+            return {
+                "valid": True,
+                "total_entries": 0,
+                "first_broken_at": None,
+                "details": "Log file is empty."
+            }
+
+        prev_hash = "0" * 64  # Genesis hash
+        total = 0
+
+        for i, line in enumerate(lines):
+            line = line.strip()
+            if not line:
+                continue
+
+            total += 1
+
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                return {
+                    "valid": False,
+                    "total_entries": total,
+                    "first_broken_at": i + 1,
+                    "details": f"Line {i + 1}: Invalid JSON"
+                }
+
+            # Check prev_hash chain
+            if entry.get("prev_hash") != prev_hash:
+                return {
+                    "valid": False,
+                    "total_entries": total,
+                    "first_broken_at": i + 1,
+                    "details": f"Line {i + 1}: Previous hash mismatch (chain broken)"
+                }
+
+            # Recompute hash and verify
+            content = (
+                f"{entry['timestamp']}|{entry['event']}|{entry['name']}"
+                f"|{entry['confidence']:.4f}|{entry.get('details', '')}"
+            )
+            expected_hash = self._compute_hash(content, prev_hash)
+
+            if entry.get("hash") != expected_hash:
+                return {
+                    "valid": False,
+                    "total_entries": total,
+                    "first_broken_at": i + 1,
+                    "details": f"Line {i + 1}: Content hash mismatch (data tampered)"
+                }
+
+            prev_hash = entry["hash"]
+
+        return {
+            "valid": True,
+            "total_entries": total,
+            "first_broken_at": None,
+            "details": f"All {total} entries verified. Log integrity intact."
+        }
+
+    def get_recent_entries(self, count: int = 10) -> list:
+        """Get the most recent log entries."""
+        if not os.path.exists(self.log_file):
+            return []
+
+        with open(self.log_file, "r") as f:
+            lines = f.readlines()
+
+        entries = []
+        for line in lines[-count:]:
+            line = line.strip()
+            if line:
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+
+        return entries
+
+
+// security.py
+
+"""
+Anti-Spoofing & Security Lock Module.
+Tracks failed attempts and enters LOCK MODE after threshold.
+Admin password stored as salted SHA-256 hash.
+"""
+
+import os
+import json
+import hashlib
+import secrets
+import time
+import config
+
+
+class SecurityManager:
+    """Manages failed attempts, lock mode, and admin authentication."""
+
+    def __init__(self):
+        os.makedirs(config.DATA_DIR, exist_ok=True)
+        self.failed_attempts = 0
+        self.locked = False
+        self.lock_time = None
+        self._load_lock_state()
+        self._ensure_admin_password()
+
+    # ─── Lock State Persistence ─────────────────────────────────────────────
+
+    def _load_lock_state(self):
+        """Load lock state from disk."""
+        if os.path.exists(config.LOCK_STATE_FILE):
+            try:
+                with open(config.LOCK_STATE_FILE, "r") as f:
+                    state = json.load(f)
+                self.locked = state.get("locked", False)
+                self.failed_attempts = state.get("failed_attempts", 0)
+                self.lock_time = state.get("lock_time", None)
+            except (json.JSONDecodeError, KeyError):
+                self.locked = False
+                self.failed_attempts = 0
+
+    def _save_lock_state(self):
+        """Persist lock state to disk."""
+        state = {
+            "locked": self.locked,
+            "failed_attempts": self.failed_attempts,
+            "lock_time": self.lock_time
+        }
+        with open(config.LOCK_STATE_FILE, "w") as f:
+            json.dump(state, f, indent=2)
+
+    # ─── Admin Password ────────────────────────────────────────────────────
+
+    def _ensure_admin_password(self):
+        """Create default admin password if none exists."""
+        if not os.path.exists(config.ADMIN_PASSWORD_FILE):
+            self.set_admin_password(config.DEFAULT_ADMIN_PASSWORD)
+            print(f"[SECURITY] Default admin password set. Change it with admin.py --set-password")
+
+    def set_admin_password(self, password: str):
+        """Set admin password (stored as salted SHA-256 hash)."""
+        salt = secrets.token_hex(16)
+        password_hash = hashlib.sha256((salt + password).encode()).hexdigest()
+
+        with open(config.ADMIN_PASSWORD_FILE, "w") as f:
+            json.dump({"salt": salt, "hash": password_hash}, f)
+
+        print("[SECURITY] Admin password updated.")
+
+    def verify_admin_password(self, password: str) -> bool:
+        """Verify admin password against stored hash."""
+        if not os.path.exists(config.ADMIN_PASSWORD_FILE):
+            return False
+
+        try:
+            with open(config.ADMIN_PASSWORD_FILE, "r") as f:
+                data = json.load(f)
+
+            salt = data["salt"]
+            stored_hash = data["hash"]
+            input_hash = hashlib.sha256((salt + password).encode()).hexdigest()
+
+            return input_hash == stored_hash
+        except (json.JSONDecodeError, KeyError):
+            return False
+
+    # ─── Attempt Tracking ──────────────────────────────────────────────────
+
+    def record_attempt(self, success: bool):
+        """
+        Record an authentication attempt.
+        Resets counter on success, increments on failure.
+        Enters LOCK MODE when threshold exceeded.
+        """
+        if success:
+            self.failed_attempts = 0
+            self.locked = False
+            self.lock_time = None
+            self._save_lock_state()
+            return
+
+        self.failed_attempts += 1
+        print(f"[SECURITY] Failed attempt {self.failed_attempts}/{config.MAX_FAILED_ATTEMPTS}")
+
+        if self.failed_attempts >= config.MAX_FAILED_ATTEMPTS:
+            self.locked = True
+            self.lock_time = time.time()
+            print(f"[SECURITY] ⚠ SYSTEM LOCKED — Too many failed attempts!")
+
+        self._save_lock_state()
+
+    def is_locked(self) -> bool:
+        """Check if system is in LOCK MODE."""
+        return self.locked
+
+    def admin_unlock(self, password: str) -> bool:
+        """
+        Attempt to unlock system with admin password.
+        Returns True if successfully unlocked.
+        """
+        if self.verify_admin_password(password):
+            self.locked = False
+            self.failed_attempts = 0
+            self.lock_time = None
+            self._save_lock_state()
+            print("[SECURITY] ✓ System unlocked by admin.")
+            return True
+        else:
+            print("[SECURITY] ✗ Invalid admin password.")
+            return False
+
+    def get_status(self) -> dict:
+        """Get current security status."""
+        return {
+            "locked": self.locked,
+            "failed_attempts": self.failed_attempts,
+            "max_attempts": config.MAX_FAILED_ATTEMPTS,
+            "lock_time": self.lock_time
+        }
+
+    def draw_lock_screen(self, frame):
+        """Draw lock mode overlay on frame."""
+        import cv2
+        h, w = frame.shape[:2]
+
+        # Dark overlay
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 50), -1)
+        cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
+
+        # Lock icon (text-based)
+        cv2.putText(frame, "SYSTEM LOCKED", (w // 2 - 180, h // 2 - 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+
+        cv2.putText(frame, f"Too many failed attempts ({self.failed_attempts})",
+                    (w // 2 - 200, h // 2 + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        cv2.putText(frame, "Run: python admin.py --unlock", (w // 2 - 190, h // 2 + 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
+
+        cv2.putText(frame, "Press 'q' to quit", (w // 2 - 100, h // 2 + 100),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+
+        return frame
+
+
+// requirements.txt
+
+opencv-python>=4.8.0
+face-recognition>=1.3.0
+dlib>=19.24.0
+mediapipe>=0.10.0
+numpy>=1.24.0
+scipy>=1.10.0
+streamlit>=1.30.0
+
+
+// recognizer.py
+
+"""
+Core Face Recognition Engine.
+Compares live face encodings against stored embeddings.
+Fully offline using face_recognition (dlib).
+"""
+
+import cv2
+import numpy as np
+import face_recognition
+import config
+
+
+def recognize_face(frame, known_data: dict) -> tuple:
+    """
+    Recognize a face in the given frame.
+
+    Args:
+        frame: BGR image (numpy array)
+        known_data: dict with "names" and "encodings" lists
+
+    Returns:
+        (name, confidence, face_location) or ("Unknown", 0.0, None)
+    """
+    if not known_data["encodings"]:
+        return ("Unknown", 0.0, None)
+
+    # Convert BGR to RGB — MUST be contiguous for dlib 20+
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    # Detect face locations
+    face_locations = face_recognition.face_locations(
+        rgb_frame, model=config.FACE_RECOGNITION_MODEL
+    )
+
+    if not face_locations:
+        return ("No Face", 0.0, None)
+
+    # Process only the largest face (by area)
+    if len(face_locations) > 1:
+        face_locations = [_largest_face(face_locations)]
+
+    face_location = face_locations[0]
+
+    # Generate encoding for detected face
+    try:
+        face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
+    except Exception as e:
+        print(f"[RECOGNIZER] Encoding error (skipping frame): {e}")
+        return ("Unknown", 0.0, face_location)
+
+    if not face_encodings:
+        return ("Unknown", 0.0, face_location)
+
+    face_encoding = face_encodings[0]
+
+    # Compare against known encodings
+    distances = face_recognition.face_distance(
+        known_data["encodings"], face_encoding
+    )
+
+    if len(distances) == 0:
+        return ("Unknown", 0.0, face_location)
+
+    # Find best match
+    best_match_idx = np.argmin(distances)
+    best_distance = distances[best_match_idx]
+    confidence = 1.0 - best_distance  # Convert distance to confidence
+
+    if confidence >= config.CONFIDENCE_THRESHOLD:
+        name = known_data["names"][best_match_idx]
+        return (name, confidence, face_location)
+    else:
+        return ("Unknown", confidence, face_location)
+
+
+def _largest_face(face_locations: list) -> tuple:
+    """Return the face location with the largest area."""
+    def area(loc):
+        top, right, bottom, left = loc
+        return (bottom - top) * (right - left)
+
+    return max(face_locations, key=area)
+
+
+def draw_recognition(frame, name: str, confidence: float, face_location, status: str = ""):
+    """
+    Draw recognition result overlay on frame.
+
+    Args:
+        frame: BGR image
+        name: Recognized name
+        confidence: Confidence score (0.0 - 1.0)
+        face_location: (top, right, bottom, left)
+        status: Additional status text
+    """
+    import cv2
+
+    if face_location is None:
+        # No face — show status at top
+        cv2.putText(frame, "No face detected", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        return frame
+
+    top, right, bottom, left = face_location
+
+    # Color based on recognition status
+    if name == "Unknown":
+        color = (0, 0, 255)      # Red
+    elif confidence >= config.CONFIDENCE_THRESHOLD:
+        color = (0, 255, 0)      # Green
+    else:
+        color = (0, 255, 255)    # Yellow
+
+    # Draw face rectangle
+    cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
+
+    # Name and confidence label
+    conf_pct = f"{confidence * 100:.1f}%"
+    label = f"{name} ({conf_pct})"
+
+    # Label background
+    label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+    cv2.rectangle(frame, (left, top - label_size[1] - 10),
+                  (left + label_size[0] + 10, top), color, -1)
+    cv2.putText(frame, label, (left + 5, top - 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+    # Status text
+    if status:
+        cv2.putText(frame, status, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+
+    return frame
+
+
+// preprocessing.py
+
+"""
+Low-Light Preprocessing Pipeline — Advanced.
+Multi-stage adaptive enhancement that aggressively boosts extremely dark frames
+so that face_recognition can detect & recognise faces even in near-black conditions.
+Fully offline — uses OpenCV only.
+"""
+
+import cv2
+import numpy as np
+import config
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Brightness Analysis
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _calculate_brightness(frame) -> float:
+    """Calculate average brightness (0-255) of a frame."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return float(np.mean(gray))
+
+
+def _classify_brightness(brightness: float) -> str:
+    """
+    Classify brightness into 5 levels:
+      PITCH_BLACK  <  15  → nearly invisible, maximum boost
+      VERY_DARK    <  40  → can barely see shapes, aggressive boost
+      DARK         <  70  → dim, standard enhancement
+      DIM          < 100  → slightly below normal, light touch
+      NORMAL       ≥ 100  → no enhancement needed
+    """
+    if brightness < config.LOW_LIGHT_PITCH_BLACK:
+        return "PITCH_BLACK"
+    elif brightness < config.LOW_LIGHT_VERY_DARK:
+        return "VERY_DARK"
+    elif brightness < config.LOW_LIGHT_DARK:
+        return "DARK"
+    elif brightness < config.LOW_LIGHT_DIM:
+        return "DIM"
+    else:
+        return "NORMAL"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Enhancement Building Blocks
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _auto_exposure_boost(frame, target_brightness: float = 90.0):
+    """
+    Simulate auto-exposure by scaling pixel values so the average brightness
+    approaches `target_brightness`.  Handles very dark frames where CLAHE
+    alone cannot recover detail.
+    """
+    current = _calculate_brightness(frame)
+    if current < 1.0:
+        current = 1.0  # avoid division by zero
+
+    scale = target_brightness / current
+    # Clamp scale to prevent blow-out (max 8× boost)
+    scale = min(scale, 8.0)
+
+    boosted = cv2.convertScaleAbs(frame, alpha=scale, beta=10)
+    return boosted
+
+
+def _apply_clahe(frame, clip_limit: float = None, grid_size: tuple = None):
+    """Apply Contrast Limited Adaptive Histogram Equalization on L channel."""
+    if clip_limit is None:
+        clip_limit = config.CLAHE_CLIP_LIMIT
+    if grid_size is None:
+        grid_size = config.CLAHE_GRID_SIZE
+
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    l_channel, a_channel, b_channel = cv2.split(lab)
+
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=grid_size)
+    l_channel = clahe.apply(l_channel)
+
+    enhanced = cv2.merge([l_channel, a_channel, b_channel])
+    return cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
+
+
+def _adaptive_gamma_correction(frame, brightness: float):
+    """
+    Compute gamma dynamically from actual brightness.
+    Darker frames → lower gamma → bigger brightness boost.
+
+    Mapping (approximate):
+      brightness  5  → gamma 0.25  (extreme boost)
+      brightness 30  → gamma 0.45
+      brightness 60  → gamma 0.65
+      brightness 90  → gamma 1.00  (no change)
+      brightness 120 → gamma 1.20  (slight darken — not applied)
+    """
+    if brightness >= 100:
+        return frame  # no correction needed
+
+    # Map brightness [0..100] → gamma [0.20..1.0]
+    gamma = max(0.20, brightness / 100.0)
+    # Additional push for very dark
+    if brightness < 30:
+        gamma *= 0.7
+
+    inv_gamma = 1.0 / gamma
+    table = np.array([
+        ((i / 255.0) ** inv_gamma) * 255
+        for i in range(256)
+    ]).astype("uint8")
+
+    return cv2.LUT(frame, table)
+
+
+def _apply_noise_reduction(frame, strength: int = None):
+    """Apply non-local means denoising (handles noise from brightness boost)."""
+    if strength is None:
+        strength = config.NOISE_REDUCTION_STRENGTH
+    return cv2.fastNlMeansDenoisingColored(
+        frame, None, strength, strength, 7, 21
+    )
+
+
+def _apply_light_denoise(frame):
+    """Lightweight bilateral filter — faster than NLM, good for moderate noise."""
+    return cv2.bilateralFilter(frame, 5, 50, 50)
+
+
+def _apply_sharpening(frame):
+    """Unsharp mask to recover edge detail after denoising/boosting."""
+    gaussian = cv2.GaussianBlur(frame, (0, 0), 2.0)
+    sharpened = cv2.addWeighted(frame, 1.5, gaussian, -0.5, 0)
+    return sharpened
+
+
+def _enhance_face_region(frame, face_box):
+    """
+    Apply extra local CLAHE specifically on the face region
+    to maximise feature visibility for recognition.
+
+    Args:
+        frame: Full BGR image
+        face_box: (top, right, bottom, left) or None
+    Returns:
+        Frame with face region further enhanced
+    """
+    if face_box is None:
+        return frame
+
+    top, right, bottom, left = face_box
+    h, w = frame.shape[:2]
+    # Add padding around face
+    pad = 20
+    top = max(0, top - pad)
+    left = max(0, left - pad)
+    bottom = min(h, bottom + pad)
+    right = min(w, right + pad)
+
+    face_roi = frame[top:bottom, left:right]
+    if face_roi.size == 0:
+        return frame
+
+    # High clip-limit CLAHE on face region
+    face_roi = _apply_clahe(face_roi, clip_limit=4.5, grid_size=(4, 4))
+    frame[top:bottom, left:right] = face_roi
+    return frame
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Main Pipeline
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def enhance_frame(frame, face_box=None):
+    """
+    Main preprocessing pipeline.
+    Applies multi-stage adaptive enhancement based on brightness level.
+
+    Args:
+        frame: BGR image (numpy array)
+        face_box: Optional (top, right, bottom, left) for face-region boost
+
+    Returns:
+        Enhanced BGR image
+    """
+    if frame is None:
+        return frame
+
+    brightness = _calculate_brightness(frame)
+    level = _classify_brightness(brightness)
+
+    if level == "PITCH_BLACK":
+        # ── STAGE 1: Auto-exposure boost to make *anything* visible ──
+        frame = _auto_exposure_boost(frame, target_brightness=80.0)
+        # ── STAGE 2: Double-pass CLAHE (progressive detail lift) ──
+        frame = _apply_clahe(frame, clip_limit=4.0, grid_size=(4, 4))
+        frame = _apply_clahe(frame, clip_limit=3.0, grid_size=(8, 8))
+        # ── STAGE 3: Adaptive gamma on the now-brighter frame ──
+        new_brightness = _calculate_brightness(frame)
+        frame = _adaptive_gamma_correction(frame, new_brightness)
+        # ── STAGE 4: Heavy denoise (boosted images are noisy) ──
+        frame = _apply_noise_reduction(frame, strength=8)
+        # ── STAGE 5: Sharpen to recover edges ──
+        frame = _apply_sharpening(frame)
+        # ── STAGE 6: Face-region local boost ──
+        frame = _enhance_face_region(frame, face_box)
+
+    elif level == "VERY_DARK":
+        frame = _auto_exposure_boost(frame, target_brightness=70.0)
+        frame = _apply_clahe(frame, clip_limit=3.5, grid_size=(8, 8))
+        frame = _adaptive_gamma_correction(frame, _calculate_brightness(frame))
+        frame = _apply_noise_reduction(frame, strength=6)
+        frame = _apply_sharpening(frame)
+        frame = _enhance_face_region(frame, face_box)
+
+    elif level == "DARK":
+        frame = _apply_clahe(frame, clip_limit=3.0, grid_size=(8, 8))
+        frame = _adaptive_gamma_correction(frame, brightness)
+        frame = _apply_noise_reduction(frame)
+        frame = _enhance_face_region(frame, face_box)
+
+    elif level == "DIM":
+        frame = _apply_clahe(frame)
+        frame = _adaptive_gamma_correction(frame, brightness)
+        frame = _apply_light_denoise(frame)
+
+    # NORMAL → no enhancement
+
+    return frame
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Status Reporting
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_brightness_status(frame) -> str:
+    """Return human-readable brightness status with level."""
+    brightness = _calculate_brightness(frame)
+    level = _classify_brightness(brightness)
+
+    icons = {
+        "PITCH_BLACK": "⚫",
+        "VERY_DARK": "🌑",
+        "DARK": "🌒",
+        "DIM": "🌓",
+        "NORMAL": "☀️",
+    }
+    icon = icons.get(level, "")
+    return f"{icon} {level} ({brightness:.0f})"
+
+
+def is_too_dark_for_recognition(frame) -> bool:
+    """
+    Quick check — is the frame so dark that even after enhancement
+    face recognition is unlikely to work?
+    Returns True if brightness < 5 (near-total darkness).
+    """
+    brightness = _calculate_brightness(frame)
+    return brightness < 5
+
+
+// main.py
+
+"""
+Main Application — Advanced Face Recognition System.
+Orchestrates webcam capture, recognition, liveness detection,
+depth/motion anti-spoofing, attendance logging, and security.
+Fully offline operation.
+"""
+
+import sys
+import os
+import time
+import cv2
+import numpy as np
+import face_recognition as fr
+from datetime import datetime
+import config
+from face_encoder import load_encodings
+from preprocessing import enhance_frame, get_brightness_status, is_too_dark_for_recognition
+from liveness import LivenessDetector
+from depth_motion_check import DepthMotionChecker
+from database import AttendanceDB
+from unknown_handler import UnknownFaceHandler
+from security import SecurityManager
+from tamper_proof_log import TamperProofLog
+from adaptive_learning import AdaptiveLearner
+
+
+class FaceRecognitionApp:
+    """Main application class orchestrating all modules."""
+
+    # ── Verification phases ──
+    PHASE_RECOGNITION = "RECOGNITION"
+    PHASE_BLINK = "BLINK"
+    PHASE_DEPTH = "DEPTH_MOTION"
+    PHASE_GRANTED = "GRANTED"
+    PHASE_DENIED = "DENIED"
+
+    def __init__(self):
+        print("\n" + "=" * 60)
+        print("  ADVANCED FACE RECOGNITION SYSTEM")
+        print("  Offline · Secure · Adaptive · Anti-Spoof")
+        print("=" * 60 + "\n")
+
+        print("[INIT] Loading modules...")
+        self.data = load_encodings()
+        self.liveness = LivenessDetector()
+        self.depth_checker = DepthMotionChecker() if config.DEPTH_CHECK_ENABLED else None
+        self.db = AttendanceDB()
+        self.unknown_handler = UnknownFaceHandler()
+        self.security = SecurityManager()
+        self.log = TamperProofLog()
+        self.adaptive = AdaptiveLearner()
+
+        if self.security.is_locked():
+            print("[INIT] ⚠ System is LOCKED. Use: python admin.py --unlock")
+        if not self.data["encodings"]:
+            print("[INIT] ⚠ No face encodings! Run: python admin.py --encode")
+
+        print("[INIT] System ready.\n")
+
+    def run(self):
+        cap = cv2.VideoCapture(config.CAMERA_INDEX)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.FRAME_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.FRAME_HEIGHT)
+
+        if not cap.isOpened():
+            print("[ERROR] Cannot open camera!")
+            sys.exit(1)
+
+        print("[CAMERA] Opened. Press 'q' to quit.\n")
+
+        # ─── State ───────────────────────────────────────────────────
+        phase = self.PHASE_RECOGNITION
+        attempt_start = time.time()
+        blink_count = 0
+        name_counter = {}
+        last_name = "UNKNOWN"
+        last_confidence = 0.0
+        last_face_loc = None
+        last_unknown_capture = time.time()
+        attempt_recorded_this_window = False
+        frame_count = 0
+        granted_time = None
+        confirmed_name = None
+        confirmed_confidence = 0.0
+
+        try:
+            while True:
+                # ─── LOCK CHECK ───────────────────────────────────
+                if self.security.is_locked():
+                    ret, frame = cap.read()
+                    if ret:
+                        frame = self.security.draw_lock_screen(frame)
+                        cv2.imshow("Face Recognition System", frame)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        break
+                    continue
+
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                frame_count += 1
+                now = time.time()
+                elapsed = now - attempt_start
+                remaining = max(0, int(config.UNKNOWN_TIMEOUT - elapsed))
+
+                # ─── 30s TIMEOUT → full reset ────────────────────
+                if elapsed > config.UNKNOWN_TIMEOUT and phase not in (self.PHASE_GRANTED, self.PHASE_DEPTH):
+                    if last_name == "UNKNOWN":
+                        self.unknown_handler._capture_image(frame, last_face_loc)
+                        self.log.append_log("TIMEOUT", "Unknown", 0, "30s expired")
+                        print("[SYSTEM] ⏱ 30s expired — unknown face.")
+                    else:
+                        print(f"[SYSTEM] ⏱ 30s expired — {last_name} didn't complete verification.")
+                        self.log.append_log("TIMEOUT", last_name, last_confidence / 100.0,
+                                            "Verification not completed")
+
+                    # FULL RESET
+                    attempt_start = time.time()
+                    blink_count = 0
+                    name_counter.clear()
+                    last_name = "UNKNOWN"
+                    last_confidence = 0.0
+                    last_face_loc = None
+                    attempt_recorded_this_window = False
+                    self.liveness.reset()
+                    if self.depth_checker:
+                        self.depth_checker.reset()
+                    phase = self.PHASE_RECOGNITION
+                    continue
+
+                # ─── PREPROCESSING ────────────────────────────────
+                enhanced = enhance_frame(frame.copy(), last_face_loc)
+                brightness = get_brightness_status(frame)
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+                display = enhanced.copy()
+                h, w = display.shape[:2]
+
+                # ═══════════════════════════════════════════════════
+                #  PHASE: ACCESS GRANTED — show 3s then stop
+                # ═══════════════════════════════════════════════════
+                if phase == self.PHASE_GRANTED:
+                    if last_face_loc:
+                        top, right, bottom, left = last_face_loc
+                        cv2.rectangle(display, (left, top), (right, bottom), (0, 255, 0), 3)
+                    overlay = display.copy()
+                    cv2.rectangle(overlay, (0, h - 90), (w, h), (0, 120, 0), -1)
+                    cv2.addWeighted(overlay, 0.6, display, 0.4, 0, display)
+                    cv2.putText(display, f"ACCESS GRANTED: {confirmed_name}",
+                                (10, h - 55), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+                    cv2.putText(display, f"Confidence: {confirmed_confidence:.1f}% | Attendance Logged",
+                                (10, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 255, 200), 1)
+                    cv2.imshow("Face Recognition System", display)
+                    if granted_time and now - granted_time > 3:
+                        print("[SYSTEM] Stopping camera.")
+                        break
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        break
+                    continue
+
+                # ═══════════════════════════════════════════════════
+                #  PHASE: DEPTH / MOTION CHECK
+                # ═══════════════════════════════════════════════════
+                if phase == self.PHASE_DEPTH and self.depth_checker:
+                    self.depth_checker.process_frame(frame)
+                    task_info = self.depth_checker.get_current_task_info()
+
+                    # Draw depth/motion UI
+                    self._draw_depth_ui(display, task_info, confirmed_name, confirmed_confidence)
+
+                    if self.depth_checker.is_complete():
+                        if self.depth_checker.is_passed():
+                            # ✅ ALL CHECKS PASSED — grant access
+                            phase = self.PHASE_GRANTED
+                            granted_time = now
+                            self.db.log_attendance(confirmed_name, confirmed_confidence / 100.0)
+                            self.log.append_log("ACCESS_GRANTED", confirmed_name,
+                                                confirmed_confidence / 100.0,
+                                                f"Blinks: {blink_count} | Depth: PASS")
+                            self.security.record_attempt(True)
+                            print(f"\n✓ ACCESS GRANTED: {confirmed_name} ({confirmed_confidence}%)")
+                        else:
+                            # ❌ Depth check failed — spoofing suspected
+                            phase = self.PHASE_DENIED
+                            self.log.append_log("DEPTH_FAIL", confirmed_name,
+                                                confirmed_confidence / 100.0,
+                                                "Depth/motion check failed — possible spoofing")
+                            self.security.record_attempt(False)
+                            print(f"\n✗ DEPTH CHECK FAILED: {confirmed_name} — possible spoofing")
+
+                            # Save spoofing image to digital_theft folder
+                            try:
+                                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                theft_path = os.path.join(
+                                    config.DIGITAL_THEFT_DIR,
+                                    f"spoof_{confirmed_name}_{ts}.jpg"
+                                )
+                                cv2.imwrite(theft_path, frame)
+                                print(f"[THEFT] Saved spoofing image: {theft_path}")
+                            except Exception as e:
+                                print(f"[THEFT] Failed to save image: {e}")
+
+                            # Show denial for 3s then reset
+                            deny_start = now
+                            while now - deny_start < 3:
+                                ret2, frame2 = cap.read()
+                                if not ret2:
+                                    break
+                                disp2 = enhance_frame(frame2.copy())
+                                h2, w2 = disp2.shape[:2]
+                                overlay2 = disp2.copy()
+                                cv2.rectangle(overlay2, (0, h2 - 90), (w2, h2), (0, 0, 180), -1)
+                                cv2.addWeighted(overlay2, 0.6, disp2, 0.4, 0, disp2)
+                                cv2.putText(disp2, "SPOOFING DETECTED — ACCESS DENIED",
+                                            (10, h2 - 55), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                                            (255, 255, 255), 2)
+                                cv2.putText(disp2, "Depth/motion check failed. Try again.",
+                                            (10, h2 - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                                            (200, 200, 255), 1)
+                                cv2.imshow("Face Recognition System", disp2)
+                                if cv2.waitKey(1) & 0xFF == ord('q'):
+                                    break
+                                now = time.time()
+
+                            # Reset everything
+                            attempt_start = time.time()
+                            blink_count = 0
+                            name_counter.clear()
+                            last_name = "UNKNOWN"
+                            last_confidence = 0.0
+                            last_face_loc = None
+                            attempt_recorded_this_window = False
+                            self.liveness.reset()
+                            self.depth_checker.reset()
+                            phase = self.PHASE_RECOGNITION
+
+                    cv2.imshow("Face Recognition System", display)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        break
+                    continue
+
+                # ═══════════════════════════════════════════════════
+                #  PHASE: RECOGNITION + BLINK (combined)
+                # ═══════════════════════════════════════════════════
+
+                # ── BLINK DETECTION (every frame) ──
+                try:
+                    blink_result = self.liveness.detect_blink(frame)
+                    blink_count = blink_result["blink_count"]
+                except Exception:
+                    pass
+
+                # ── FACE RECOGNITION (every Nth frame) ──
+                if frame_count % config.PROCESS_EVERY_N_FRAMES == 0:
+                    try:
+                        boxes = fr.face_locations(rgb, model=config.FACE_RECOGNITION_MODEL)
+                        encodings = fr.face_encodings(rgb, boxes)
+                    except Exception as e:
+                        print(f"[WARN] Recognition error: {e}")
+                        boxes, encodings = [], []
+
+                    for (top, right, bottom, left), encoding in zip(boxes, encodings):
+                        name = "UNKNOWN"
+                        confidence = 0.0
+
+                        if len(self.data["encodings"]) > 0:
+                            distances = fr.face_distance(self.data["encodings"], encoding)
+                            min_dist = float(np.min(distances))
+                            index = int(np.argmin(distances))
+                            confidence = round((1 - min_dist) * 100, 2)
+
+                            if min_dist < 0.50 and confidence > 50:
+                                name = self.data["names"][index]
+
+                        if confidence < 45:
+                            name = "UNKNOWN"
+
+                        # Multi-frame confirmation
+                        if name != "UNKNOWN":
+                            name_counter[name] = name_counter.get(name, 0) + 1
+                        else:
+                            name_counter.clear()
+
+                        last_name = name
+                        last_confidence = confidence
+                        last_face_loc = (top, right, bottom, left)
+
+                        # ── FACE CONFIRMED + BLINKS DONE → start depth check ──
+                        needed_frames = config.PROCESS_EVERY_N_FRAMES * 3
+                        if (name != "UNKNOWN"
+                                and name_counter.get(name, 0) >= needed_frames
+                                and blink_count >= config.REQUIRED_BLINKS):
+
+                            confirmed_name = name
+                            confirmed_confidence = confidence
+
+                            if config.DEPTH_CHECK_ENABLED and self.depth_checker:
+                                # Start depth/motion verification
+                                phase = self.PHASE_DEPTH
+                                self.depth_checker.start_session()
+                                self.liveness.reset()
+                                print(f"\n[DEPTH] Starting depth/motion check for {name}...")
+                            else:
+                                # Depth check disabled — grant immediately
+                                phase = self.PHASE_GRANTED
+                                granted_time = now
+                                self.db.log_attendance(name, confidence / 100.0)
+                                self.log.append_log("ACCESS_GRANTED", name, confidence / 100.0,
+                                                    f"Blinks: {blink_count}")
+                                self.security.record_attempt(True)
+                                self.liveness.reset()
+                                print(f"\n✓ ACCESS GRANTED: {name} ({confidence}%)")
+                            break
+
+                        # ── Unknown face tracking ──
+                        if name == "UNKNOWN" and confidence < 45:
+                            if now - last_unknown_capture >= config.UNKNOWN_CAPTURE_INTERVAL:
+                                self.unknown_handler.process_unknown(
+                                    frame, (top, right, bottom, left))
+                                last_unknown_capture = now
+
+                            if not attempt_recorded_this_window:
+                                attempt_recorded_this_window = True
+                                self.security.record_attempt(False)
+                                self.log.append_log("ACCESS_DENIED", "Unknown",
+                                                    confidence / 100.0, "Unknown face")
+
+                        # ── Near-miss → adaptive learning ──
+                        elif name == "UNKNOWN" and 45 <= confidence < 50:
+                            best_name = self.data["names"][
+                                int(np.argmin(fr.face_distance(
+                                    self.data["encodings"], encoding)))
+                            ]
+                            self.adaptive.add_to_queue(best_name, confidence / 100.0,
+                                                       encoding, frame)
+
+                        if self.security.is_locked():
+                            break
+
+                # ─── DRAW UI (recognition + blink phase) ─────────
+                self._draw_recognition_ui(display, last_name, last_confidence,
+                                          last_face_loc, blink_count, brightness,
+                                          remaining, name_counter, phase)
+
+                cv2.imshow("Face Recognition System", display)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+
+        except KeyboardInterrupt:
+            print("\n[SYSTEM] Interrupted.")
+        finally:
+            cap.release()
+            cv2.destroyAllWindows()
+            self.liveness.release()
+            if self.depth_checker:
+                self.depth_checker.release()
+            print("[SYSTEM] Camera closed. Goodbye.")
+
+    # ─── UI Drawing Helpers ──────────────────────────────────────────────────
+
+    def _draw_recognition_ui(self, display, name, confidence, face_loc,
+                              blink_count, brightness, remaining, name_counter, phase):
+        """Draw the recognition + blink phase UI overlay."""
+        h, w = display.shape[:2]
+
+        # Top bar
+        overlay = display.copy()
+        cv2.rectangle(overlay, (0, 0), (w, 55), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.65, display, 0.35, 0, display)
+        cv2.putText(display, "Face Recognition System", (10, 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+        cv2.putText(display, f"Light: {brightness}", (10, 45),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1)
+
+        sec = self.security.get_status()
+        cv2.putText(display, f"Fails: {sec['failed_attempts']}/{sec['max_attempts']}",
+                    (w - 130, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1)
+        cv2.putText(display, f"Time: {remaining}s",
+                    (w - 130, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+
+        # Phase indicator
+        depth_status = " + Depth Check" if config.DEPTH_CHECK_ENABLED else ""
+        cv2.putText(display, f"Blinks: {blink_count}/{config.REQUIRED_BLINKS}{depth_status}",
+                    (w // 2 - 80, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+
+        # Face box
+        if face_loc is not None:
+            top, right, bottom, left = face_loc
+            color = (0, 255, 0) if name != "UNKNOWN" else (0, 0, 255)
+            cv2.rectangle(display, (left, top), (right, bottom), color, 2)
+
+            label = f"{name} ({confidence:.1f}%)"
+            lsz = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+            cv2.rectangle(display, (left, top - lsz[1] - 12),
+                          (left + lsz[0] + 10, top), color, -1)
+            cv2.putText(display, label, (left + 5, top - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+            if name != "UNKNOWN":
+                needed = config.PROCESS_EVERY_N_FRAMES * 3
+                confirmed = min(name_counter.get(name, 0), needed)
+                status = f"Confirm: {confirmed}/{needed} | Blink to verify"
+                cv2.putText(display, status, (left, bottom + 22),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+            else:
+                cv2.putText(display, f"{remaining}s left",
+                            (left, bottom + 22),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+
+        # Bottom bar
+        overlay = display.copy()
+        cv2.rectangle(overlay, (0, h - 30), (w, h), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.5, display, 0.5, 0, display)
+        cv2.putText(display, "Press 'q' to quit", (w - 160, h - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 150, 150), 1)
+
+    def _draw_depth_ui(self, display, task_info, name, confidence):
+        """Draw the depth/motion verification phase UI overlay."""
+        h, w = display.shape[:2]
+
+        state = task_info.get("state", "")
+        instruction = task_info.get("instruction", "")
+        icon = task_info.get("icon", "")
+        task_idx = task_info.get("task_index", 0)
+        total = task_info.get("total_tasks", 0)
+        time_remaining = task_info.get("time_remaining", 0)
+        progress = task_info.get("progress", [])
+
+        # ── Top banner — depth check phase indicator ──
+        overlay = display.copy()
+        cv2.rectangle(overlay, (0, 0), (w, 70), (80, 40, 0), -1)
+        cv2.addWeighted(overlay, 0.7, display, 0.3, 0, display)
+
+        cv2.putText(display, f"DEPTH/MOTION CHECK — {name} ({confidence:.1f}%)",
+                    (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        task_progress = f"Task {task_idx + 1}/{total}"
+        if state == "ALL_DONE":
+            task_progress = "All tasks complete"
+        cv2.putText(display, task_progress,
+                    (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+        # ── Task results so far ──
+        result_x = 200
+        for i, res in enumerate(progress):
+            icon_text = "PASS" if res["passed"] else "FAIL"
+            color = (0, 255, 0) if res["passed"] else (0, 0, 255)
+            cv2.putText(display, f"T{i+1}:{icon_text}",
+                        (result_x + i * 100, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+
+        # ── Central instruction ──
+        if state == "BASELINE":
+            # Show "hold still" instruction
+            text = "Hold STILL — capturing baseline..."
+            text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+            text_x = (w - text_size[0]) // 2
+            text_y = h // 2
+            # Background box
+            cv2.rectangle(display, (text_x - 15, text_y - 35),
+                          (text_x + text_size[0] + 15, text_y + 15), (0, 0, 0), -1)
+            cv2.putText(display, text, (text_x, text_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
+
+        elif state == "TASK_ACTIVE":
+            # Show task instruction prominently
+            text = f"{icon}  {instruction}"
+            text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)[0]
+            text_x = (w - text_size[0]) // 2
+            text_y = h // 2
+
+            # Pulsing background
+            cv2.rectangle(display, (text_x - 20, text_y - 40),
+                          (text_x + text_size[0] + 20, text_y + 20), (0, 80, 0), -1)
+            cv2.putText(display, text, (text_x, text_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+
+            # Timer bar
+            timer_fraction = time_remaining / config.DEPTH_TASK_TIMEOUT
+            bar_width = int(w * 0.6)
+            bar_x = (w - bar_width) // 2
+            bar_y = text_y + 40
+            cv2.rectangle(display, (bar_x, bar_y), (bar_x + bar_width, bar_y + 15),
+                          (50, 50, 50), -1)
+            filled = int(bar_width * timer_fraction)
+            bar_color = (0, 255, 0) if timer_fraction > 0.3 else (0, 0, 255)
+            cv2.rectangle(display, (bar_x, bar_y), (bar_x + filled, bar_y + 15),
+                          bar_color, -1)
+            cv2.putText(display, f"{time_remaining:.1f}s",
+                        (bar_x + bar_width + 10, bar_y + 12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+        # ── Bottom bar ──
+        overlay = display.copy()
+        cv2.rectangle(overlay, (0, h - 30), (w, h), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.5, display, 0.5, 0, display)
+        cv2.putText(display, "Anti-spoofing verification in progress...",
+                    (10, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+        cv2.putText(display, "Press 'q' to quit", (w - 160, h - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 150, 150), 1)
+
+
+def main():
+    app = FaceRecognitionApp()
+    app.run()
+
+
+if __name__ == "__main__":
+    main()
+
+
+// liveness.py
+
+"""
+Liveness Detection — Blink-Based Anti-Spoofing.
+Simple blink counter using MediaPipe Face Mesh (fully offline).
+No internal timer — the caller controls timing.
+"""
+
+import cv2
+import numpy as np
+import mediapipe as mp
+from scipy.spatial import distance as dist
+import config
+
+
+# MediaPipe Face Mesh landmark indices for eyes
+LEFT_EYE_IDX = [362, 385, 387, 263, 373, 380]
+RIGHT_EYE_IDX = [33, 160, 158, 133, 153, 144]
+
+
+class LivenessDetector:
+    """Simple blink counter using MediaPipe Face Mesh."""
+
+    def __init__(self):
+        self.mp_face_mesh = mp.solutions.face_mesh
+        self.face_mesh = self.mp_face_mesh.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+        self.blink_count = 0
+        self.eye_was_closed = False
+
+    def reset(self):
+        """Reset blink count."""
+        self.blink_count = 0
+        self.eye_was_closed = False
+
+    def _calculate_ear(self, eye_landmarks) -> float:
+        """
+        Calculate Eye Aspect Ratio (EAR).
+        EAR ≈ 0.25-0.30 when open, drops to ~0.05 when closed.
+        """
+        v1 = dist.euclidean(eye_landmarks[1], eye_landmarks[5])
+        v2 = dist.euclidean(eye_landmarks[2], eye_landmarks[4])
+        h = dist.euclidean(eye_landmarks[0], eye_landmarks[3])
+        if h == 0:
+            return 0.3
+        return (v1 + v2) / (2.0 * h)
+
+    def _get_eye_landmarks(self, landmarks, indices, frame_shape):
+        """Extract eye landmark coordinates."""
+        h, w = frame_shape[:2]
+        return np.array([(landmarks[i].x * w, landmarks[i].y * h) for i in indices],
+                        dtype=np.float64)
+
+    def detect_blink(self, frame) -> dict:
+        """
+        Process a frame and detect blinks.
+        Returns dict with blink_count and current EAR.
+        No internal timer — caller handles timing.
+        """
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self.face_mesh.process(rgb)
+
+        ear = 0.0
+        blinked_now = False
+
+        if results.multi_face_landmarks:
+            face = results.multi_face_landmarks[0].landmark
+
+            left_eye = self._get_eye_landmarks(face, LEFT_EYE_IDX, frame.shape)
+            right_eye = self._get_eye_landmarks(face, RIGHT_EYE_IDX, frame.shape)
+
+            left_ear = self._calculate_ear(left_eye)
+            right_ear = self._calculate_ear(right_eye)
+            ear = (left_ear + right_ear) / 2.0
+
+            # Detect blink: eyes closed then opened
+            if ear < config.EAR_THRESHOLD:
+                self.eye_was_closed = True
+            else:
+                if self.eye_was_closed:
+                    # Eye was closed and now opened = one blink
+                    self.blink_count += 1
+                    blinked_now = True
+                    print(f"[BLINK] Detected! Count: {self.blink_count}/{config.REQUIRED_BLINKS}")
+                self.eye_was_closed = False
+
+        return {
+            "blink_count": self.blink_count,
+            "ear": round(ear, 3),
+            "blinked_now": blinked_now,
+            "face_detected": results.multi_face_landmarks is not None
+        }
+
+    def release(self):
+        """Release MediaPipe resources."""
+        self.face_mesh.close()
+
+
+// face_encoder.py
+
+"""
+Face encoder for converting stored face images into 128-d embeddings.
+Supports incremental training so new users can be added without
+overwriting embeddings that are already stored.
+"""
+
+import os
+import pickle
+import shutil
+import stat
+
+import face_recognition
+
+import config
+
+
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
+
+
+def _empty_encodings() -> dict:
+    """Return the default payload used across the app."""
+    return {"names": [], "encodings": []}
+
+
+def _remove_readonly(func, path, _excinfo):
+    """Retry folder deletion after clearing the read-only flag on Windows."""
+    try:
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+    except Exception:
+        pass
+
+
+def _load_existing_encodings() -> dict:
+    """Load encodings from disk without emitting startup warnings."""
+    if not os.path.exists(config.ENCODINGS_FILE):
+        return _empty_encodings()
+
+    try:
+        with open(config.ENCODINGS_FILE, "rb") as f:
+            data = pickle.load(f)
+    except (pickle.UnpicklingError, EOFError, TypeError, ValueError):
+        return _empty_encodings()
+
+    return {
+        "names": list(data.get("names", [])),
+        "encodings": list(data.get("encodings", [])),
+    }
+
+
+def _save_encodings(data: dict) -> None:
+    """Persist encodings to disk."""
+    os.makedirs(config.ENCODINGS_DIR, exist_ok=True)
+    with open(config.ENCODINGS_FILE, "wb") as f:
+        pickle.dump(data, f)
+
+
+def encode_known_faces(delete_originals: bool = True, preserve_existing: bool = True) -> dict:
+    """
+    Encode any pending images stored under known_faces/<PersonName>/.
+
+    When preserve_existing is True, new embeddings are appended to the
+    existing database instead of rebuilding it from scratch.
+    Only the source images for successfully processed people are deleted.
+    """
+    existing_data = _load_existing_encodings() if preserve_existing else _empty_encodings()
+    encodings_data = {
+        "names": list(existing_data["names"]),
+        "encodings": list(existing_data["encodings"]),
+    }
+
+    if not os.path.exists(config.KNOWN_FACES_DIR):
+        print("[ENCODER] No known_faces directory found.")
+        return encodings_data
+
+    people = [
+        d
+        for d in os.listdir(config.KNOWN_FACES_DIR)
+        if os.path.isdir(os.path.join(config.KNOWN_FACES_DIR, d))
+    ]
+
+    if not people:
+        print("[ENCODER] No person directories found in known_faces/")
+        return encodings_data
+
+    print(f"[ENCODER] Found {len(people)} people to encode...")
+
+    processed_people = []
+    new_embeddings = 0
+
+    for person_name in people:
+        person_dir = os.path.join(config.KNOWN_FACES_DIR, person_name)
+        image_files = [
+            f for f in os.listdir(person_dir)
+            if f.lower().endswith(IMAGE_EXTENSIONS)
+        ]
+
+        if not image_files:
+            print(f"  [SKIP] {person_name}: No images found")
+            continue
+
+        person_encodings = []
+        for img_file in image_files:
+            img_path = os.path.join(person_dir, img_file)
+            try:
+                image = face_recognition.load_image_file(img_path)
+                face_encs = face_recognition.face_encodings(
+                    image,
+                    num_jitters=config.FACE_ENCODING_JITTERS,
+                )
+                if face_encs:
+                    person_encodings.append(face_encs[0])
+                    print(f"  [OK] {person_name}/{img_file} encoded")
+                else:
+                    print(f"  [WARN] {person_name}/{img_file} no face detected")
+            except Exception as e:
+                print(f"  [ERROR] {person_name}/{img_file} {e}")
+
+        if not person_encodings:
+            continue
+
+        encodings_data["names"].extend([person_name] * len(person_encodings))
+        encodings_data["encodings"].extend(person_encodings)
+        processed_people.append(person_name)
+        new_embeddings += len(person_encodings)
+        print(f"  [DONE] {person_name}: {len(person_encodings)} encodings")
+
+    if new_embeddings:
+        _save_encodings(encodings_data)
+        print(
+            f"[ENCODER] Added {new_embeddings} new encodings. "
+            f"Total stored: {len(encodings_data['encodings'])}"
+        )
+    else:
+        print("[ENCODER] No new encodings were created.")
+
+    if delete_originals and processed_people:
+        for person_name in processed_people:
+            person_dir = os.path.join(config.KNOWN_FACES_DIR, person_name)
+            if not os.path.exists(person_dir):
+                continue
+            try:
+                shutil.rmtree(person_dir, onerror=_remove_readonly)
+                print(f"  [PRIVACY] Deleted original images for {person_name}")
+            except Exception as e:
+                print(f"  [WARN] Could not delete {person_name} folder: {e}")
+                print("         You may delete it manually for privacy.")
+        print("[ENCODER] Processed original images deleted for privacy.")
+
+    return encodings_data
+
+
+def load_encodings() -> dict:
+    """Load saved encodings from disk."""
+    if not os.path.exists(config.ENCODINGS_FILE):
+        print("[ENCODER] No encodings file found. Run encoding first.")
+        return _empty_encodings()
+
+    data = _load_existing_encodings()
+    print(f"[ENCODER] Loaded {len(data['encodings'])} encodings for {len(set(data['names']))} people")
+    return data
+
+
+def add_encoding(name: str, encoding) -> None:
+    """Add one encoding to the existing set without retraining everything."""
+    data = _load_existing_encodings()
+    data["names"].append(name)
+    data["encodings"].append(encoding)
+    _save_encodings(data)
+    print(f"[ENCODER] Added new encoding for {name}. Total: {len(data['encodings'])}")
+
+
+def get_registered_names() -> list:
+    """Get a unique list of registered names."""
+    data = load_encodings()
+    return list(set(data["names"]))
+
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("  FACE ENCODER - Incremental Encoding Pipeline")
+    print("=" * 60)
+    print(f"\nScanning: {config.KNOWN_FACES_DIR}")
+    print("Place images in: known_faces/<PersonName>/image.jpg\n")
+
+    before = len(_load_existing_encodings()["encodings"])
+    result = encode_known_faces(delete_originals=True, preserve_existing=True)
+    after = len(result["encodings"])
+    added = max(0, after - before)
+
+    if added:
+        print(f"\nSuccessfully added {added} new embeddings")
+        print("Processed source images were deleted for privacy")
+    else:
+        print("\nNo faces were encoded. Check your known_faces/ directory.")
+
+
+// admin.py
+
+"""
+Admin CLI — System administration for the Face Recognition System.
+Usage:
+    python admin.py --encode            Encode faces from known_faces/
+    python admin.py --unlock            Unlock the system
+    python admin.py --set-password      Set/change admin password
+    python admin.py --attendance        View today's attendance
+    python admin.py --attendance 2026-04-06  View specific date
+    python admin.py --review            Review adaptive learning queue
+    python admin.py --verify-logs       Verify tamper-proof log integrity
+    python admin.py --status            Show system status
+"""
+
+import argparse
+import sys
+
+
+def cmd_encode():
+    """Encode faces from known_faces/ directory."""
+    from face_encoder import encode_known_faces, load_encodings
+    print("\n" + "=" * 60)
+    print("  ENCODING FACES")
+    print("=" * 60)
+    before_total = len(load_encodings()["encodings"])
+    result = encode_known_faces(delete_originals=True, preserve_existing=True)
+    added = max(0, len(result["encodings"]) - before_total)
+    if added:
+        print(f"\n✓ Added {added} new embeddings")
+        print(f"✓ Total stored: {len(result['encodings'])} embeddings for {len(set(result['names']))} people")
+    else:
+        print("\n✗ No faces encoded. Place images in known_faces/<Name>/")
+
+
+def cmd_unlock():
+    """Unlock the system with admin password."""
+    from security import SecurityManager
+    sm = SecurityManager()
+
+    if not sm.is_locked():
+        print("System is not locked.")
+        return
+
+    print("\n⚠ SYSTEM IS LOCKED")
+    password = input("Enter admin password: ")
+
+    if sm.admin_unlock(password):
+        print("✓ System unlocked successfully.")
+    else:
+        print("✗ Invalid password. System remains locked.")
+
+
+def cmd_set_password():
+    """Set or change admin password."""
+    from security import SecurityManager
+    sm = SecurityManager()
+
+    print("\n--- Set Admin Password ---")
+    new_password = input("Enter new password: ")
+    confirm = input("Confirm new password: ")
+
+    if new_password != confirm:
+        print("✗ Passwords do not match.")
+        return
+
+    if len(new_password) < 4:
+        print("✗ Password must be at least 4 characters.")
+        return
+
+    sm.set_admin_password(new_password)
+    print("✓ Admin password updated.")
+
+
+def cmd_attendance(date=None):
+    """View attendance records."""
+    from database import AttendanceDB
+    db = AttendanceDB()
+
+    if date:
+        records = db.get_attendance(date)
+        print(f"\n--- Attendance for {date} ---")
+    else:
+        records = db.get_attendance()
+        from datetime import datetime
+        date = datetime.now().strftime("%Y-%m-%d")
+        print(f"\n--- Attendance for Today ({date}) ---")
+
+    if not records:
+        print("No records found.")
+        return
+
+    print(f"{'Name':<20} {'Time':<10} {'Confidence':<12}")
+    print("-" * 42)
+    for r in records:
+        conf = f"{r['confidence'] * 100:.1f}%" if r['confidence'] else "N/A"
+        print(f"{r['name']:<20} {r['time']:<10} {conf:<12}")
+
+    print(f"\nTotal: {len(records)} entries")
+
+
+def cmd_review():
+    """Review adaptive learning queue."""
+    from adaptive_learning import AdaptiveLearner
+    learner = AdaptiveLearner()
+
+    pending = learner.get_pending_reviews()
+
+    if not pending:
+        print("\nNo pending reviews.")
+        return
+
+    print(f"\n--- Adaptive Learning Review ({len(pending)} pending) ---\n")
+
+    for i, entry in enumerate(pending):
+        print(f"  [{i}] {entry['name']} — Confidence: {entry['confidence']:.1%}")
+        print(f"      Timestamp: {entry['timestamp']}")
+        if entry.get('image_path'):
+            print(f"      Image: {entry['image_path']}")
+        print()
+
+    while True:
+        action = input("Enter index to approve (a<idx>), reject (r<idx>), or 'q' to quit: ").strip()
+
+        if action.lower() == 'q':
+            break
+        elif action.startswith('a') and action[1:].isdigit():
+            idx = int(action[1:])
+            learner.approve_entry(idx)
+            print(f"  ✓ Entry {idx} approved — embedding added")
+        elif action.startswith('r') and action[1:].isdigit():
+            idx = int(action[1:])
+            learner.reject_entry(idx)
+            print(f"  ✗ Entry {idx} rejected")
+        else:
+            print("  Invalid input. Use a0, r0, a1, r1, etc.")
+
+
+def cmd_verify_logs():
+    """Verify tamper-proof log integrity."""
+    from tamper_proof_log import TamperProofLog
+    log = TamperProofLog()
+
+    print("\n--- Log Integrity Verification ---")
+    result = log.verify_integrity()
+
+    if result["valid"]:
+        print(f"✓ {result['details']}")
+    else:
+        print(f"✗ INTEGRITY VIOLATION: {result['details']}")
+        print(f"  Total entries checked: {result['total_entries']}")
+        print(f"  First broken at entry: {result['first_broken_at']}")
+
+
+def cmd_status():
+    """Show system status overview."""
+    from security import SecurityManager
+    from database import AttendanceDB
+    from face_encoder import load_encodings, get_registered_names
+    from tamper_proof_log import TamperProofLog
+    from adaptive_learning import AdaptiveLearner
+
+    print("\n" + "=" * 60)
+    print("  SYSTEM STATUS")
+    print("=" * 60)
+
+    # Security
+    sm = SecurityManager()
+    status = sm.get_status()
+    lock_str = "🔒 LOCKED" if status["locked"] else "🔓 Unlocked"
+    print(f"\n  Security:     {lock_str}")
+    print(f"  Failed Tries: {status['failed_attempts']}/{status['max_attempts']}")
+
+    # Encodings
+    names = get_registered_names()
+    data = load_encodings()
+    print(f"\n  Registered:   {len(names)} people")
+    print(f"  Embeddings:   {len(data['encodings'])} total")
+    if names:
+        print(f"  Names:        {', '.join(sorted(names))}")
+
+    # Attendance
+    db = AttendanceDB()
+    today_count = db.get_count()
+    print(f"\n  Today's Att:  {today_count} entries")
+
+    # Log integrity
+    log = TamperProofLog()
+    integrity = log.verify_integrity()
+    int_str = "✓ Intact" if integrity["valid"] else "✗ TAMPERED"
+    print(f"\n  Log Status:   {int_str} ({integrity['total_entries']} entries)")
+
+    # Adaptive learning
+    learner = AdaptiveLearner()
+    stats = learner.get_stats()
+    print(f"\n  Review Queue: {stats['pending']} pending, {stats['reviewed']} reviewed")
+
+    print("\n" + "=" * 60)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Face Recognition System — Admin CLI",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python admin.py --encode             Encode faces from known_faces/
+  python admin.py --unlock             Unlock locked system
+  python admin.py --set-password       Change admin password
+  python admin.py --attendance         Today's attendance
+  python admin.py --attendance 2026-04-06   Specific date
+  python admin.py --review             Review adaptive learning queue
+  python admin.py --verify-logs        Check log integrity
+  python admin.py --status             System overview
+        """
+    )
+
+    parser.add_argument("--encode", action="store_true", help="Encode faces from known_faces/")
+    parser.add_argument("--unlock", action="store_true", help="Unlock the system")
+    parser.add_argument("--set-password", action="store_true", help="Set admin password")
+    parser.add_argument("--attendance", nargs="?", const="today", help="View attendance")
+    parser.add_argument("--review", action="store_true", help="Review adaptive learning queue")
+    parser.add_argument("--verify-logs", action="store_true", help="Verify log integrity")
+    parser.add_argument("--status", action="store_true", help="Show system status")
+
+    args = parser.parse_args()
+
+    if args.encode:
+        cmd_encode()
+    elif args.unlock:
+        cmd_unlock()
+    elif args.set_password:
+        cmd_set_password()
+    elif args.attendance is not None:
+        date = None if args.attendance == "today" else args.attendance
+        cmd_attendance(date)
+    elif args.review:
+        cmd_review()
+    elif args.verify_logs:
+        cmd_verify_logs()
+    elif args.status:
+        cmd_status()
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
+
+
+// adaptive_learning.py
+
+"""
+Adaptive Learning Module.
+Stores low-confidence matches for admin review.
+Supports incremental embedding updates without full retraining.
+"""
+
+import os
+import pickle
+import time
+from datetime import datetime
+import cv2
+import config
+from face_encoder import add_encoding
+
+
+class AdaptiveLearner:
+    """Manages low-confidence match review queue and incremental learning."""
+
+    def __init__(self):
+        os.makedirs(config.DATA_DIR, exist_ok=True)
+        self.review_queue = self._load_queue()
+
+    def _load_queue(self) -> list:
+        """Load review queue from disk."""
+        if os.path.exists(config.REVIEW_QUEUE_FILE):
+            try:
+                with open(config.REVIEW_QUEUE_FILE, "rb") as f:
+                    return pickle.load(f)
+            except (pickle.UnpicklingError, EOFError):
+                return []
+        return []
+
+    def _save_queue(self):
+        """Save review queue to disk."""
+        with open(config.REVIEW_QUEUE_FILE, "wb") as f:
+            pickle.dump(self.review_queue, f)
+
+    def should_queue(self, confidence: float) -> bool:
+        """Check if a match should be queued for review (between low and high thresholds)."""
+        return config.ADAPTIVE_LOW_THRESHOLD <= confidence < config.ADAPTIVE_HIGH_THRESHOLD
+
+    def add_to_queue(self, name: str, confidence: float, encoding, frame=None):
+        """
+        Add a low-confidence match to the review queue.
+
+        Args:
+            name: Best-match name
+            confidence: Confidence score
+            encoding: 128-d face encoding
+            frame: Optional frame for reference (saved as image)
+        """
+        timestamp = datetime.now().isoformat()
+        entry = {
+            "name": name,
+            "confidence": round(confidence, 4),
+            "encoding": encoding,
+            "timestamp": timestamp,
+            "reviewed": False,
+            "image_path": None
+        }
+
+        # Save reference image if provided
+        if frame is not None:
+            img_dir = os.path.join(config.DATA_DIR, "review_images")
+            os.makedirs(img_dir, exist_ok=True)
+            img_name = f"review_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+            img_path = os.path.join(img_dir, img_name)
+            cv2.imwrite(img_path, frame)
+            entry["image_path"] = img_path
+
+        self.review_queue.append(entry)
+        self._save_queue()
+
+        print(f"[ADAPTIVE] Queued for review: {name} ({confidence:.1%})")
+
+    def get_pending_reviews(self) -> list:
+        """Get all pending (unreviewed) entries."""
+        return [e for e in self.review_queue if not e["reviewed"]]
+
+    def approve_entry(self, index: int) -> bool:
+        """
+        Approve a review entry — adds its encoding to the known set.
+
+        Args:
+            index: Index in the pending review list
+
+        Returns:
+            True if approved successfully
+        """
+        pending = self.get_pending_reviews()
+        if 0 <= index < len(pending):
+            entry = pending[index]
+            name = entry["name"]
+            encoding = entry["encoding"]
+
+            # Add encoding to known set (incremental, no full retrain)
+            add_encoding(name, encoding)
+
+            # Mark as reviewed
+            entry["reviewed"] = True
+            entry["approved"] = True
+            self._save_queue()
+
+            print(f"[ADAPTIVE] ✓ Approved: {name} — encoding added")
+            return True
+
+        print(f"[ADAPTIVE] Invalid index: {index}")
+        return False
+
+    def reject_entry(self, index: int) -> bool:
+        """
+        Reject a review entry — marks as reviewed but does not add encoding.
+
+        Args:
+            index: Index in the pending review list
+
+        Returns:
+            True if rejected successfully
+        """
+        pending = self.get_pending_reviews()
+        if 0 <= index < len(pending):
+            entry = pending[index]
+            entry["reviewed"] = True
+            entry["approved"] = False
+            self._save_queue()
+
+            print(f"[ADAPTIVE] ✗ Rejected: {entry['name']}")
+            return True
+
+        print(f"[ADAPTIVE] Invalid index: {index}")
+        return False
+
+    def clear_reviewed(self):
+        """Remove all reviewed entries from the queue."""
+        self.review_queue = [e for e in self.review_queue if not e["reviewed"]]
+        self._save_queue()
+        print("[ADAPTIVE] Cleared reviewed entries.")
+
+    def get_stats(self) -> dict:
+        """Get adaptive learning statistics."""
+        pending = len(self.get_pending_reviews())
+        total = len(self.review_queue)
+        reviewed = total - pending
+        return {
+            "total": total,
+            "pending": pending,
+            "reviewed": reviewed
+        }
+
+
